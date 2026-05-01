@@ -3,4 +3,6 @@ pmu_sync_sample.ko
 *.order
 Module.symvers
 .tmp_versions
+*.mod
 *.mod.c
+modules.builtin*

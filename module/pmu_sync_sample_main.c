@@ -7,7 +7,7 @@
 #include <asm/io.h>
 #include <linux/fs.h>
 #include <linux/slab.h>
-#include <asm/uaccess.h>
+#include <linux/uaccess.h>
 #include <linux/sched.h>
 #include <linux/wait.h>
 
@@ -93,11 +93,12 @@ int my_release(struct inode *inode,struct file *filep);
 ssize_t my_read(struct file *filep,char *buff,size_t count,loff_t *offp );
 ssize_t my_write(struct file *filep,const char *buff,size_t count,loff_t *offp );
 
-struct file_operations my_fops={
-    open: my_open,
-    read: my_read,
-    write: my_write,
-    release:my_release,
+struct file_operations my_fops = {
+    .owner   = THIS_MODULE,
+    .open    = my_open,
+    .read    = my_read,
+    .write   = my_write,
+    .release = my_release,
 };
 
 int my_open(struct inode *inode,struct file *filep)
@@ -302,7 +303,7 @@ static void process_status_update(void) {
     }
 }
 
-static struct attribute * myattr[] = {
+static struct attribute *myattr_attrs[] = {
     &period_attr.attr,
     &status_attr.attr,
     &missed_attr.attr,
@@ -312,6 +313,7 @@ static struct attribute * myattr[] = {
     &ctr3_attr.attr,
     NULL
 };
+ATTRIBUTE_GROUPS(myattr);
 
 static ssize_t default_show(struct kobject *kobj, struct attribute *attr,
         char *buf)
@@ -345,8 +347,8 @@ static struct sysfs_ops myops = {
 };
 
 static struct kobj_type mytype = {
-    .sysfs_ops = &myops,
-    .default_attrs = myattr,
+    .sysfs_ops      = &myops,
+    .default_groups = myattr_groups,
 };
 
 struct kobject *mykobj;
@@ -367,7 +369,7 @@ static int init_sysfs_entries(void)
     return err;
 }
 
-int init_module(void)
+static int __init pmu_init(void)
 {
     int i, rc;
     printk(KERN_ERR "Initializing PMU Synchronous Sampler...");
@@ -398,7 +400,7 @@ int init_module(void)
     return 0;
 }
 
-void cleanup_module(void)
+static void __exit pmu_exit(void)
 {
     unsigned int proc;
     struct buffer* b;
@@ -444,5 +446,7 @@ void cleanup_module(void)
     printk(KERN_ERR "Done\n");
 }
 
+module_init(pmu_init);
+module_exit(pmu_exit);
 MODULE_LICENSE("GPL");
 

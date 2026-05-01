@@ -2,12 +2,18 @@
 
 
 #include <linux/interrupt.h>
+#include <linux/nmi.h>
 #include <asm/apic.h>
 #include <asm/msr-index.h>
 #include <asm/perf_event.h>
 #include <asm/nmi.h>
-#include <linux/kdebug.h>
-#include <linux/kprobes.h>
+
+/* Exported by the kernel (arch/x86/kernel/cpu/perfctr-watchdog.c) but not
+ * declared in any installed header on 5.15. */
+extern int  reserve_perfctr_nmi(unsigned int msr);
+extern int  reserve_evntsel_nmi(unsigned int msr);
+extern void release_perfctr_nmi(unsigned int msr);
+extern void release_evntsel_nmi(unsigned int msr);
 
 unsigned long num_ctrs = 4;
 
@@ -54,8 +60,8 @@ void dump_regs(void) {
 
 }
 
-static int __kprobes
-my_nmi_handler(struct notifier_block *self, unsigned long cmd, void *__args) {
+static int my_nmi_handler(unsigned int cmd, struct pt_regs *regs)
+{
     size_t i;
     total_interrupts += 1;
 
@@ -72,23 +78,16 @@ my_nmi_handler(struct notifier_block *self, unsigned long cmd, void *__args) {
         wrmsrl(MSR_CORE_PERF_GLOBAL_CTRL, 0);
     }
 
-    native_apic_mem_write(APIC_LVTPC, APIC_DM_NMI); 
-    return NOTIFY_STOP;
+    native_apic_mem_write(APIC_LVTPC, APIC_DM_NMI);
+    return NMI_HANDLED;
 }
 
-static __read_mostly struct notifier_block my_nmi_notifier = {
-    .notifier_call  = my_nmi_handler,
-    .next           = NULL,
-    .priority       = 0,
-};
-
 void register_interrupt(void) {
-    register_die_notifier(&my_nmi_notifier);
+    register_nmi_handler(NMI_LOCAL, my_nmi_handler, 0, "sync-pmu");
 }
 
 void deregister_interrupt(void) {
-    // De-register NMI interrupt handler
-    unregister_die_notifier(&my_nmi_notifier);
+    unregister_nmi_handler(NMI_LOCAL, "sync-pmu");
 }
 
 void EnablePerfVect(uint32_t wantEnable) {
