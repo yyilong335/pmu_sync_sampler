@@ -63,6 +63,12 @@ void dump_regs(void) {
 static int my_nmi_handler(unsigned int cmd, struct pt_regs *regs)
 {
     size_t i;
+
+    /* DEBUG: only CPU 3 has counters armed; ignore NMIs from anywhere else
+     * so the watchdog / kgdb path still gets them. */
+    if (smp_processor_id() != 3)
+        return NMI_DONE;
+
     total_interrupts += 1;
 
     wrmsrl(MSR_CORE_PERF_GLOBAL_OVF_CTRL, (1ULL << 63) | (1ULL << 62) | (0xF));

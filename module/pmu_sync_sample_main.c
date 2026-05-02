@@ -292,10 +292,13 @@ static void dumpCtrs(void* d) {
 }
 
 
+/* DEBUG: pin sampling to CPU 3 only while we hunt the read-path lockup. */
+#define PMU_DEBUG_TARGET_CPU 3
+
 static void stopAll(void) {
     shutdown = 1;
     // De-configure the counters
-    on_each_cpu(stopCtrsLocal, NULL, 1);
+    smp_call_function_single(PMU_DEBUG_TARGET_CPU, stopCtrsLocal, NULL, 1);
 
     deregister_interrupt();
 
@@ -322,11 +325,11 @@ static void process_status_update(void) {
             // De-configure the counters
             shutdown = 0;
             register_interrupt();
-            on_each_cpu(startCtrs, NULL, 1);
+            smp_call_function_single(PMU_DEBUG_TARGET_CPU, startCtrs, NULL, 1);
             break;
         case 2:
             printk(KERN_ERR "    Interrupts taken: %llu", total_interrupts);
-            on_each_cpu(dumpCtrs, NULL, 1);
+            smp_call_function_single(PMU_DEBUG_TARGET_CPU, dumpCtrs, NULL, 1);
             break;
         default:
             printk(KERN_ERR "Sync-PMU: unknown code %u", status_attr.value);

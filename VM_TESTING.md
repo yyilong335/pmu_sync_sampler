@@ -36,7 +36,7 @@ document is the recipe.
 | Stage 1 | Smoke insmod / rmmod, no sampling | ✓ done |
 | Stage 2 / Subtask 2 | udev cdev replaces hardcoded major 222 | ✓ done, committed |
 | Pre-existing bug | `native_apic_mem_write` silently no-ops under x2APIC; PMI never reached the NMI vector. Three call sites in `module/intel.c` switched to mode-agnostic `apic_write()`. | ✓ patched in working tree |
-| Stage 3 / Subtask 0 | irq_work-based NMI safety: NMI handler is now lock-free; buffer hand-off and `wake_up_all` deferred to per-CPU `irq_work` callback | code written; **insmod, status transitions, and short bursts of sampling at periods 10ms → 50µs are all clean (no oops, `missed=0`, no lockup), but a sustained `dd` read on `/dev/pmu_samples` while sampling at period=50000 deadlocked all 4 vCPUs.** Snapshot revert recovered. Root cause unidentified. |
+| Stage 3 / Subtask 0 | irq_work-based NMI safety: NMI handler is now lock-free; buffer hand-off and `wake_up_all` deferred to per-CPU `irq_work` callback | **Single-CPU verified correct.** With the module restricted to CPU 3 only (debug build), the [microbench](microbench.c) drives full-load sampling at the paper's period=50000 cadence with concurrent `dd` reads — no hang, no oops, captured samples have `core=3`, `cycles≈period`, plausible INST_RETIRED counts. Multi-CPU + concurrent `dd` at period=50000 still deadlocks; hypothesis: 4 CPUs' `irq_work` callbacks contending on the `read_queue` wait-queue lock via `wake_up_all`, not yet proven. |
 | Stage 4 / Subtask 3 | Expand to 8 GP + 3 fixed counters | not started |
 | Stage 5 / Subtask 4 | 50 000-cycle paper verification | not started |
 
@@ -46,19 +46,47 @@ document is the recipe.
 *(`post-subtask0` is intentionally not yet created — gated on resolving the
 read-path hang.)*
 
+**What single-CPU testing showed:**
+
+With `PMU_DEBUG_TARGET_CPU = 3` in `pmu_sync_sample_main.c` and the NMI
+handler bailing out on non-CPU-3, three tests all passed cleanly:
+
+| Test | Period | Workload | NMIs on CPU 3 | Captured | `missed` | dd reads |
+|---|---|---|---|---|---|---|
+| A | 100,000 | microbench, no dd | 100,712 | 816 (= 8×102) | 99,896 | n/a |
+| B | 100,000 | microbench + dd 10 buffers | 120,383 | 1,836 | 118,547 | OK (40 KB) |
+| C | 50,000 (paper) | microbench + dd 20 buffers | 174,171 | 2,856 | 171,315 | OK (80 KB) |
+
+In Test A the captured count exactly matches `8 buffer-pool × 102 entries`
+— without a reader, `empty_buffers` drains, `irq_work` can't refill
+`lbuffer`, every subsequent NMI bumps `missed`. That's correct behavior;
+the `missed` counter is doing its job.
+
+Decoded `samples.bin` from Test C: `core=3`, `num_samples=102`, `pid` =
+microbench's pid, `cycles≈51000≈period`, all four GP counters showing
+matching INST_RETIRED.ANY values (the slight drift between counter[0..3]
+within a sample is the handler retiring instructions while reading them
+sequentially — exactly what you'd expect).
+
+Conclusion: **Subtask 0's irq_work design is structurally sound on a
+single CPU.** The deadlock was a multi-CPU phenomenon.
+
 **Open follow-ups:**
-1. Diagnose the `dd`-induced lockup in Subtask 0. Working hypotheses:
-   (a) `irq_work_queue` from NMI is racing with `my_read`'s
-   `wait_event_interruptible` re-evaluation; (b) under high PMI rate, LVTPC
-   re-arm via `apic_write` in `my_nmi_handler` causes the next overflow's
-   pending PMI to fire before the handler fully returns, starving `irq_work`
-   delivery; (c) `wake_up_all` from `irq_work` callback contends with
-   `my_read`'s wait-queue lock in a way that traps under load. Next step:
-   instrument `pmu_irq_work_fn` with `printk_once` per CPU and re-run with
-   period=1 ms (1000 PMI/s) and `dd` reading; that should stay below the
-   pile-up rate while still exercising the read path.
-2. The `stopAll()` global-PMU clobber (README issue #2) — out of scope until
-   the read-path hang is resolved.
+1. Diagnose the multi-CPU `dd` lockup. Most likely 4 CPUs' `irq_work`
+   callbacks racing on the `read_queue` wait-queue lock via `wake_up_all`.
+   Quick test: replace `wake_up_all` with `wake_up_interruptible` (single
+   waiter is enough — there's only one `dd` reader), or batch wakes by
+   only calling from one CPU. Other candidates: `append_blist`/`pop_blist`
+   contention on the shared blist locks at 4× rate, scheduler issues from
+   simultaneous cross-CPU `try_to_wake_up`.
+2. The `stopAll()` global-PMU clobber (README issue #2) — out of scope.
+
+**Debug-only changes currently in tree (do not merge to a stable
+release):** `PMU_DEBUG_TARGET_CPU=3` in
+[`module/pmu_sync_sample_main.c`](module/pmu_sync_sample_main.c) and
+the matching CPU-3 guard in
+[`module/intel.c`](module/intel.c)'s NMI handler. Revert both before
+running multi-CPU tests.
 
 ---
 
