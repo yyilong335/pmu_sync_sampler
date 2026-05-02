@@ -78,7 +78,7 @@ static int my_nmi_handler(unsigned int cmd, struct pt_regs *regs)
         wrmsrl(MSR_CORE_PERF_GLOBAL_CTRL, 0);
     }
 
-    native_apic_mem_write(APIC_LVTPC, APIC_DM_NMI);
+    apic_write(APIC_LVTPC, APIC_DM_NMI);
     return NMI_HANDLED;
 }
 
@@ -92,9 +92,9 @@ void deregister_interrupt(void) {
 
 void EnablePerfVect(uint32_t wantEnable) {
     if (wantEnable) {
-        native_apic_mem_write(APIC_LVTPC, APIC_DM_NMI); //PERF_MON_VECTOR);
+        apic_write(APIC_LVTPC, APIC_DM_NMI); //PERF_MON_VECTOR);
     } else {
-        native_apic_mem_write(APIC_LVTPC, APIC_LVT_MASKED);
+        apic_write(APIC_LVTPC, APIC_LVT_MASKED);
     }
     return;
 }

@@ -12,6 +12,7 @@
 #include <linux/wait.h>
 #include <linux/cdev.h>
 #include <linux/device.h>
+#include <linux/irq_work.h>
 
 #include "sample_buffer.h"
 #include "pmu_api.h"
@@ -89,6 +90,8 @@ exit:
 }
 
 DEFINE_PER_CPU(struct buffer*, lbuffer);
+DEFINE_PER_CPU(struct buffer*, pending_full);
+DEFINE_PER_CPU(struct irq_work, pmu_irqwk);
 static struct blist  empty_buffers;
 static struct blist  full_buffers;
 
@@ -211,52 +214,75 @@ static void initialize_buffer(struct buffer* b) {
     b->num_samples = 0;
 }
 
+static void pmu_irq_work_fn(struct irq_work *work)
+{
+    int proc = smp_processor_id();
+    struct buffer *full = per_cpu(pending_full, proc);
+
+    if (full != NULL) {
+        per_cpu(pending_full, proc) = NULL;
+        append_blist(&full_buffers, full);
+        wake_up_all(&read_queue);
+    }
+    if (per_cpu(lbuffer, proc) == NULL) {
+        struct buffer *fresh = pop_blist(&empty_buffers);
+        if (fresh != NULL) {
+            initialize_buffer(fresh);
+            per_cpu(lbuffer, proc) = fresh;
+        }
+        /* if NULL, next NMI bumps missed -- not a deadlock */
+    }
+}
 
 void gatherSample(void) {
     unsigned int proc = smp_processor_id();
-    struct buffer* b = per_cpu(lbuffer, proc); 
+    struct buffer* b = per_cpu(lbuffer, proc);
     struct sample* s;
     unsigned i;
 
+    /* NMI context: cannot take blist spinlocks. If no buffer is
+     * available locally, drop the sample and let the deferred
+     * irq_work refill us before the next PMI. */
     if (b == NULL) {
-        b = pop_blist(&empty_buffers);
-        if (b == NULL) {
-            // No available buffers!
-            missed_attr.value += 1;
-            return;
-        }
-        initialize_buffer(b);
-        per_cpu(lbuffer, proc) = b;
+        missed_attr.value += 1;
+        return;
     }
+
     s = &b->samples[b->num_samples++];
     s->cycles = read_ccnt();
     s->cycles += period;
     s->pid = current->pid;
     for (i=0; i<num_ctrs; i++) {
         s->counters[i] = read_pmn(i);
-    }    
+    }
 
     if (b->num_samples >= BUFFER_ENTRIES) {
-        append_blist(&full_buffers, b);
+        per_cpu(pending_full, proc) = b;
         per_cpu(lbuffer, proc) = NULL;
-        wake_up_all(&read_queue);
+        irq_work_queue(this_cpu_ptr(&pmu_irqwk));
     }
 }
 
 
 static void startCtrs(void* d) {
     unsigned int proc = smp_processor_id();
+    struct buffer *fresh;
     unsigned long cfgs[6] = {
-        ctr0_attr.value,  
-        ctr1_attr.value, 
-        ctr2_attr.value, 
+        ctr0_attr.value,
+        ctr1_attr.value,
+        ctr2_attr.value,
         ctr3_attr.value
     };
     printk(KERN_ERR "Configuring PMU on core %u\n", proc);
 
     if (per_cpu(lbuffer, proc) != NULL)
         append_blist(&empty_buffers, per_cpu(lbuffer, proc));
-    per_cpu(lbuffer, proc) = NULL;
+
+    /* Pre-fill so the first NMI has somewhere to write. */
+    fresh = pop_blist(&empty_buffers);
+    if (fresh != NULL)
+        initialize_buffer(fresh);
+    per_cpu(lbuffer, proc) = fresh;
 
     startCtrsLocal(cfgs);
 }
@@ -393,8 +419,12 @@ static int __init pmu_init(void)
     init_sysfs_entries();
 
     // Initialize buffers
-    for (i=0; i<8; i++) { 
+    for (i=0; i<8; i++) {
         append_blist(&empty_buffers, kzalloc(sizeof(struct buffer), GFP_KERNEL));
+    }
+
+    for_each_possible_cpu(i) {
+        init_irq_work(per_cpu_ptr(&pmu_irqwk, i), pmu_irq_work_fn);
     }
 
     // Set up char device (udev creates /dev/pmu_samples automatically)
@@ -440,6 +470,12 @@ static void __exit pmu_exit(void)
     stopAll();
     cleanup_arch();
 
+    /* NMIs are quiesced by stopAll(); drain any irq_work still in flight
+     * before we touch the per-CPU pointers it might write to. */
+    for_each_possible_cpu(proc) {
+        irq_work_sync(per_cpu_ptr(&pmu_irqwk, proc));
+    }
+
     printk(KERN_ERR "Flushing data");
 
     for (proc=0; proc < nr_cpu_ids; proc++) {
@@ -447,7 +483,11 @@ static void __exit pmu_exit(void)
             append_blist(&full_buffers, per_cpu(lbuffer, proc));
             per_cpu(lbuffer, proc) = NULL;
         }
-    } 
+        if (per_cpu(pending_full, proc)) {
+            append_blist(&full_buffers, per_cpu(pending_full, proc));
+            per_cpu(pending_full, proc) = NULL;
+        }
+    }
 
     printk(KERN_ERR "    Freeing memory");
     while ((b = pop_blist(&empty_buffers))) {
