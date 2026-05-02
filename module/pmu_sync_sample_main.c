@@ -10,6 +10,8 @@
 #include <linux/uaccess.h>
 #include <linux/sched.h>
 #include <linux/wait.h>
+#include <linux/cdev.h>
+#include <linux/device.h>
 
 #include "sample_buffer.h"
 #include "pmu_api.h"
@@ -19,6 +21,10 @@
 uint64_t period = 100000;
 volatile unsigned char shutdown = 0;
 volatile uint64_t total_interrupts = 0;
+
+static dev_t pmu_dev;
+static struct cdev pmu_cdev;
+static struct class *pmu_class;
 
 struct blist {
     spinlock_t lock;
@@ -391,10 +397,16 @@ static int __init pmu_init(void)
         append_blist(&empty_buffers, kzalloc(sizeof(struct buffer), GFP_KERNEL));
     }
 
-    // Set up char device
-    if(register_chrdev(222,"pmu_samples", &my_fops)){
-        printk("<1>failed to register");
-    }  
+    // Set up char device (udev creates /dev/pmu_samples automatically)
+    if (alloc_chrdev_region(&pmu_dev, 0, 1, "pmu_samples") < 0) {
+        printk(KERN_ERR "<1>alloc_chrdev_region failed");
+        return -ENODEV;
+    }
+    cdev_init(&pmu_cdev, &my_fops);
+    pmu_cdev.owner = THIS_MODULE;
+    cdev_add(&pmu_cdev, pmu_dev, 1);
+    pmu_class = class_create(THIS_MODULE, "pmu_samples");
+    device_create(pmu_class, NULL, pmu_dev, NULL, "pmu_samples");
 
     printk(KERN_ERR "    Finished initializing.");
     return 0;
@@ -416,7 +428,10 @@ static void __exit pmu_exit(void)
         kfree(mykobj);
     }
 
-    unregister_chrdev(222, "pmu_samples");
+    device_destroy(pmu_class, pmu_dev);
+    class_destroy(pmu_class);
+    cdev_del(&pmu_cdev);
+    unregister_chrdev_region(pmu_dev, 1);
 
     printk(KERN_ERR "    Turning off interrupt handler");
 

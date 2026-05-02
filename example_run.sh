@@ -8,11 +8,6 @@ test "$1" -lt 10000 && echo "Period must be at least 10,000." >&2 && exit 1
 ## Initialize module
 modprobe -r pmu_sync_sample
 modprobe pmu_sync_sample
-if [ ! -c /dev/pmu_samples ]
-then
-	rm -f /dev/pmu_samples
-	mknod /dev/pmu_samples c 222 0
-fi
 echo 0 > /sys/sync_pmu/status
 
 ## Set parameters
