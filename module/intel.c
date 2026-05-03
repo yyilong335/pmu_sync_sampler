@@ -37,8 +37,12 @@ uint64_t read_fixed(unsigned i) {
 
 #define write_ccnt(V) wrmsrl(MSR_ARCH_PERFMON_FIXED_CTR1, (V))
 #define read_cnf(I, V) rdmsrl(MSR_ARCH_PERFMON_EVENTSEL0 + (I), V)
+/* Pass through user bits 0..15 (event/umask), 18 (edge), 19 (pin),
+ * 21 (anythread), 23 (invert), 24..31 (cmask). Force USR=OS=EN=1,
+ * INT=0 (only FIXED1 raises PMI in this driver). */
 #define pmn_config(I, C) wrmsrl(MSR_ARCH_PERFMON_EVENTSEL0 + (I), \
-            ((0xFFFF & C)) | (1ULL << 16) /* USR */   \
+            ((C) & 0xFFACFFFFULL)         \
+            | (1ULL << 16) /* USR */      \
             | (1ULL << 17) /* OS */       \
             | (1ULL << 22) /* EN */ );
 

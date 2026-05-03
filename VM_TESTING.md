@@ -55,22 +55,72 @@ sampling safe to enable, Subtasks 3/4 expand and validate it).
 ### GP event selection — `events.conf`
 
 The 8 GP counters are programmed from [`events.conf`](events.conf), one
-non-comment line per slot, format `<NAME> <(umask<<8)|event>`. Slots
-beyond the last entry are zeroed (counter is enabled but `EVENT=0` is
-"no event"). The 3 fixed counters are always-on
-(INST_RETIRED.ANY, CPU_CLK_UNHALTED.CORE, CPU_CLK_UNHALTED.REF_TSC) and
-not user-configurable. Default set (Skylake-SP):
+non-comment line per slot, format `<NAME> <EVENTSEL_LOW32>`. The
+encoding is the low 32 bits of `MSR_PERFEVTSEL` — i.e. `event(0..7) |
+umask(8..15) | edge(18) | anythread(21) | invert(23) | cmask(24..31)`.
+USR/OS/EN are forced by the driver and `INT` is forced off (only
+FIXED1 raises PMI). Slots beyond the last entry are zeroed (counter
+is enabled but `EVENT=0` is "no event"). The 3 fixed counters are
+always-on (INST_RETIRED.ANY, CPU_CLK_UNHALTED.CORE,
+CPU_CLK_UNHALTED.REF_TSC) and not user-configurable.
+
+Current set (Skylake-SP, from [`event.md`](event.md)):
 
 | Slot | Name | Encoding | Event |
 |---|---|---|---|
-| 0 | L1D_LOAD       | 0x81D0 | MEM_INST_RETIRED.ALL_LOADS |
-| 1 | L1D_STORE      | 0x82D0 | MEM_INST_RETIRED.ALL_STORES |
-| 2 | BR_INST_ALL    | 0x00C4 | BR_INST_RETIRED.ALL_BRANCHES |
-| 3 | L1D_READ_MISS  | 0x08D1 | MEM_LOAD_RETIRED.L1_MISS |
-| 4 | L1I_MISS       | 0x0283 | ICACHE_64B.IFTAG_MISS |
+| 0 | STALL_ISSUE     | 0x0180010E | UOPS_ISSUED.STALL_CYCLES (cmask=1, invert=1) |
+| 1 | STALL_RETIRE    | 0x018002C2 | UOPS_RETIRED.STALL_CYCLES (cmask=1, invert=1) |
+| 2 | LOAD            | 0x81D0     | MEM_INST_RETIRED.ALL_LOADS |
+| 3 | STORE           | 0x82D0     | MEM_INST_RETIRED.ALL_STORES |
+| 4 | BRANCH          | 0x00C4     | BR_INST_RETIRED.ALL_BRANCHES |
+| 5 | L1D_REPLACEMENT | 0x0151     | L1D.REPLACEMENT |
+| 6 | L1I_MISS        | 0x0283     | ICACHE_64B.IFTAG_MISS |
+| 7 | LLC_REFERENCE   | 0x4F2E     | LONGEST_LAT_CACHE.REFERENCE |
+
+CMask + Invert are required for the stall events; the driver's
+`pmn_config` macro now passes through bits 0..15 (event+umask),
+18 (edge), 19 (pin), 21 (anythread), 23 (invert), 24..31 (cmask),
+and forces USR/OS/EN.
 
 Edit `events.conf` to change the set; [`start_sampler.sh`](start_sampler.sh)
 loads the module, sets `period`, writes each slot, and starts sampling.
+
+### Load + Store vs LLC_REFERENCE on a memory-bound workload
+
+[`microbench_mem.c`](microbench_mem.c) builds a 16 MB pointer-chase
+chain (256 K nodes, Fisher–Yates shuffled, 1 cache line per node) so
+each step touches a fresh line — > L2 (1 MB), < LLC (22 MB). At
+period=100,000 cycles, with the first 1024 samples (init + shuffle
+phase) trimmed:
+
+| Mode | LOAD | STORE | LLC_REF | (L+S)/LLC | LOAD/LLC |
+|---|---|---|---|---|---|
+| `do_stores=1` (load + store same line) | 1,270 | 1,151 | 996 | **2.43** | 1.27 |
+| `do_stores=0` (load only) | 1,241 | 228 | 959 | **1.53** | 1.29 |
+
+**Load + Store does not equal LLC_REFERENCE** for either mode. The
+ratio in the mixed mode (~2.4) is the expected behavior: a pointer
+chase to a cold line generates one demand fetch (1 LLC reference),
+the line is now hot in L1, so the immediately-following store to the
+same line hits L1 and produces 0 additional LLC refs. Net per
+iteration: 1 load + 1 store = 1 LLC ref → ratio 2:1.
+
+For `do_stores=0`, only the loads remain. `LOAD/LLC ≈ 1.29` says
+~77 % of retired loads go all the way to LLC; the remaining ~23 % are
+absorbed somewhere — most plausibly Skylake-SP's L2 spatial / HW
+prefetcher learning the fixed permutation after a few cycles. Loop
+overhead loads (stack/return) are negligible at -O2 with `register`
+declarations.
+
+The cleanest "Load + Store = LLC_REFERENCE" pattern would require a
+workload where every memory instruction hits a *different* cold line
+— e.g. streaming reads at stride > line through a buffer > L2 with
+HW prefetchers disabled. The pointer chase as written conflates each
+load with its own paired store, which doubles the ratio.
+
+Stalls in this workload are extreme as expected:
+`STALL_ISSUE/cyc ≈ 0.96`, `STALL_RETIRE/cyc ≈ 0.95` — pointer-chase is
+~95 % stall-bound on KVM-passthrough Skylake.
 
 ---
 
