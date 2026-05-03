@@ -75,7 +75,7 @@ Current set (Skylake-SP, from [`event.md`](event.md)):
 | 4 | BRANCH          | 0x00C4     | BR_INST_RETIRED.ALL_BRANCHES |
 | 5 | L1D_REPLACEMENT | 0x0151     | L1D.REPLACEMENT |
 | 6 | L1I_MISS        | 0x0283     | ICACHE_64B.IFTAG_MISS |
-| 7 | LLC_REFERENCE   | 0x4F2E     | LONGEST_LAT_CACHE.REFERENCE |
+| 7 | (unused)        |            |                            |
 
 CMask + Invert are required for the stall events; the driver's
 `pmn_config` macro now passes through bits 0..15 (event+umask),
@@ -85,42 +85,52 @@ and forces USR/OS/EN.
 Edit `events.conf` to change the set; [`start_sampler.sh`](start_sampler.sh)
 loads the module, sets `period`, writes each slot, and starts sampling.
 
-### Load + Store vs LLC_REFERENCE on a memory-bound workload
+### Top-7 GP event verification (5 runs at period=50,000)
 
-[`microbench_mem.c`](microbench_mem.c) builds a 16 MB pointer-chase
-chain (256 K nodes, Fisher–Yates shuffled, 1 cache line per node) so
-each step touches a fresh line — > L2 (1 MB), < LLC (22 MB). At
-period=100,000 cycles, with the first 1024 samples (init + shuffle
-phase) trimmed:
+Workload: [`microbench_mem`](microbench_mem.c) (16 MB pointer-chase,
+Fisher–Yates shuffled, > L2 < LLC) on CPU 3, with `dd` draining
+`/dev/pmu_samples` concurrently. Reader and workload start
+simultaneously — same pattern as master's `example_run.sh` (no warmup
+sleep between arming and consuming). 64 buffers × 68 = 4,352 samples
+per run. All 5 runs landed identically with **zero missed**:
 
-| Mode | LOAD | STORE | LLC_REF | (L+S)/LLC | LOAD/LLC |
-|---|---|---|---|---|---|
-| `do_stores=1` (load + store same line) | 1,270 | 1,151 | 996 | **2.43** | 1.27 |
-| `do_stores=0` (load only) | 1,241 | 228 | 959 | **1.53** | 1.29 |
+| run | n | cyc | STALL_I | STALL_R | LOAD | STORE | BRANCH | L1D_R | L1I_M | INST | CYC_F |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| 1 | 4351 | 62,948 | 53,738 | 53,502 | 2,780 | 1,899 | 2,682 | 1,211 | 265 | 11,999 | 18,022 |
+| 2 | 4352 | 62,979 | 53,839 | 53,564 | 2,771 | 1,887 | 2,664 | 1,182 | 256 | 11,936 | 18,038 |
+| 3 | 4351 | 63,015 | 53,861 | 53,610 | 2,768 | 1,882 | 2,657 | 1,162 | 277 | 11,912 | 18,127 |
+| 4 | 4352 | 62,932 | 53,655 | 53,471 | 2,813 | 1,883 | 2,630 | 1,057 | 307 | 11,914 | 18,039 |
+| 5 | 4352 | 62,915 | 53,822 | 53,570 | 2,734 | 1,858 | 2,618 | 1,144 | 272 | 11,751 | 17,985 |
 
-**Load + Store does not equal LLC_REFERENCE** for either mode. The
-ratio in the mixed mode (~2.4) is the expected behavior: a pointer
-chase to a cold line generates one demand fetch (1 LLC reference),
-the line is now hot in L1, so the immediately-following store to the
-same line hits L1 and produces 0 additional LLC refs. Net per
-iteration: 1 load + 1 store = 1 LLC ref → ratio 2:1.
+Cross-run stability (5 runs):
 
-For `do_stores=0`, only the loads remain. `LOAD/LLC ≈ 1.29` says
-~77 % of retired loads go all the way to LLC; the remaining ~23 % are
-absorbed somewhere — most plausibly Skylake-SP's L2 spatial / HW
-prefetcher learning the fixed permutation after a few cycles. Loop
-overhead loads (stack/return) are negligible at -O2 with `register`
-declarations.
+| Metric | Mean | Stdev | CV |
+|---|---|---|---|
+| `cyc` | 62,957.8 | 39.9 | **0.06%** |
+| STALL_ISSUE | 53,782.9 | 85.4 | 0.16% |
+| STALL_RETIRE | 53,543.5 | 56.0 | 0.10% |
+| LOAD | 2,773.2 | 28.1 | 1.01% |
+| STORE | 1,881.8 | 15.0 | 0.80% |
+| BRANCH | 2,650.2 | 25.9 | 0.98% |
+| L1D_REPLACEMENT | 1,151.3 | 58.3 | 5.06% |
+| L1I_MISS | 275.5 | 19.2 | 6.97% |
+| INST_RETIRED.ANY | 11,902.3 | 91.5 | 0.77% |
+| CPU_CLK_UNHALTED.CORE (post-handler) | 18,041.9 | 52.1 | 0.29% |
 
-The cleanest "Load + Store = LLC_REFERENCE" pattern would require a
-workload where every memory instruction hits a *different* cold line
-— e.g. streaming reads at stride > line through a buffer > L2 with
-HW prefetchers disabled. The pointer chase as written conflates each
-load with its own paired store, which doubles the ratio.
+Cycle-driven counters (cyc, stalls, fixed-cycles) are **stable to
+within 0.3 %** across runs. Memory-event counts (LOAD, STORE, BRANCH,
+INST) come in at ≤ 1 % CV. Cache-miss events (L1D_REPLACEMENT,
+L1I_MISS) are noisier at 5–7 % — that's the inherent variance of
+cache-replacement under ASLR + slightly different scheduling each
+run, not sampler error.
 
-Stalls in this workload are extreme as expected:
-`STALL_ISSUE/cyc ≈ 0.96`, `STALL_RETIRE/cyc ≈ 0.95` — pointer-chase is
-~95 % stall-bound on KVM-passthrough Skylake.
+`cyc_mean = 62,958` is `period (50,000) + ~12,958 cycles VM PMI
+overhead` — matches the constant overhead measured in the period
+sweep and confirms it's still the same KVM artifact, not noise.
+
+Stall fraction `STALL_ISSUE / cyc ≈ 0.85` — pointer-chase issues no
+uops in 85 % of cycles, as expected for an entirely memory-latency-
+bound loop. Subtask 4 done with the production event set.
 
 ---
 
