@@ -52,6 +52,11 @@ sudo systemctl stop thermald
 sudo sysctl -w kernel.watchdog=0
 sudo sysctl -w kernel.nmi_watchdog=0
 
+# Disable ASLR so per-run cache placement is deterministic (otherwise
+# L1D_REPLACEMENT / L1I_MISS counts wobble run-to-run as code/data land
+# on different cache sets each invocation).
+sudo sysctl -w kernel.randomize_va_space=0
+
 # Allow perf_event_open for non-root (persists via sysctl.conf)
 sudo sysctl -w kernel.perf_event_paranoid=-1
 if ! grep -q "^kernel.perf_event_paranoid=-1" /etc/sysctl.conf; then
