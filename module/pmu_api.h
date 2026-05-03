@@ -3,6 +3,11 @@
 
 #include <linux/types.h>
 
+/* CPU on which PMU counters are armed. The user's workload runs
+ * `taskset -c PMU_TARGET_CPU ./prog`; counters on other CPUs are not
+ * configured and the NMI handler ignores NMIs from those CPUs. */
+#define PMU_TARGET_CPU 3
+
 // Provided in architecture-specific c file
 extern unsigned long num_ctrs;
 uint64_t read_ccnt(void);

@@ -15,12 +15,17 @@ in the README's "Status & known issues" section; this doc adds **Subtask 0**
 (the NMI/spinlock fix) which the README flags as a prerequisite to safe use
 but does not design.
 
-Two decisions captured up front:
+Three decisions captured up front:
 1. Fix the NMI/spinlock deadlock as **Subtask 0** before running Subtask 4 at
    the paper's 50,000-cycle period. Doing it inside the VM is safe and is also
    the prerequisite to ever returning to bare metal.
 2. Get the source into the guest by `git clone` from inside the guest
    (no virtfs / 9p share).
+3. **Production target is single-CPU sampling, not all-CPU.** The user's
+   actual workload is `taskset -c 3 ./program` and only needs PMU samples
+   from CPU 3 while that program runs. So the module is configured to arm
+   counters on CPU 3 only (`PMU_DEBUG_TARGET_CPU = 3`); the all-CPU dd
+   contention bug seen during early testing is therefore out of scope.
 
 ---
 
@@ -36,20 +41,18 @@ document is the recipe.
 | Stage 1 | Smoke insmod / rmmod, no sampling | ✓ done |
 | Stage 2 / Subtask 2 | udev cdev replaces hardcoded major 222 | ✓ done, committed |
 | Pre-existing bug | `native_apic_mem_write` silently no-ops under x2APIC; PMI never reached the NMI vector. Three call sites in `module/intel.c` switched to mode-agnostic `apic_write()`. | ✓ patched in working tree |
-| Stage 3 / Subtask 0 | irq_work-based NMI safety: NMI handler is now lock-free; buffer hand-off and `wake_up_all` deferred to per-CPU `irq_work` callback | **Single-CPU verified correct.** With the module restricted to CPU 3 only (debug build), the [microbench](microbench.c) drives full-load sampling at the paper's period=50000 cadence with concurrent `dd` reads — no hang, no oops, captured samples have `core=3`, `cycles≈period`, plausible INST_RETIRED counts. Multi-CPU + concurrent `dd` at period=50000 still deadlocks; hypothesis: 4 CPUs' `irq_work` callbacks contending on the `read_queue` wait-queue lock via `wake_up_all`, not yet proven. |
-| Stage 4 / Subtask 3 | Expand to 8 GP + 3 fixed counters | not started |
-| Stage 5 / Subtask 4 | 50 000-cycle paper verification | not started |
+| Stage 3 / Subtask 0 | irq_work-based NMI safety on CPU 3 (production target) | ✓ **done.** With CPU-3-only sampling and a [microbench](microbench.c) busy-loop on CPU 3, `dd` reads run concurrently at the paper's period=50,000 cadence — no hang, no oops, decoded samples have `core=3`, `cycles≈period`, plausible INST_RETIRED counts. |
+| Stage 4 / Subtask 3 | Expand to 8 GP + 3 fixed counters (CPU 3 only) | next up |
+| Stage 5 / Subtask 4 | 50,000-cycle paper-style verification on CPU 3 | not started |
 
 **Snapshots in libvirt:**
 - `clean-build` — toolchain installed, repo built, no insmod yet.
 - `post-subtask2` — Subtask 2 verified.
-*(`post-subtask0` is intentionally not yet created — gated on resolving the
-read-path hang.)*
+- *(`post-subtask0` to be created after the next clean run; safe to take now.)*
 
-**What single-CPU testing showed:**
+**Single-CPU verification on CPU 3:**
 
-With `PMU_DEBUG_TARGET_CPU = 3` in `pmu_sync_sample_main.c` and the NMI
-handler bailing out on non-CPU-3, three tests all passed cleanly:
+Three tests at period=100,000 and 50,000 (paper cadence), all clean:
 
 | Test | Period | Workload | NMIs on CPU 3 | Captured | `missed` | dd reads |
 |---|---|---|---|---|---|---|
@@ -57,36 +60,40 @@ handler bailing out on non-CPU-3, three tests all passed cleanly:
 | B | 100,000 | microbench + dd 10 buffers | 120,383 | 1,836 | 118,547 | OK (40 KB) |
 | C | 50,000 (paper) | microbench + dd 20 buffers | 174,171 | 2,856 | 171,315 | OK (80 KB) |
 
-In Test A the captured count exactly matches `8 buffer-pool × 102 entries`
-— without a reader, `empty_buffers` drains, `irq_work` can't refill
-`lbuffer`, every subsequent NMI bumps `missed`. That's correct behavior;
-the `missed` counter is doing its job.
+Test A's captured count exactly matches `8 buffer-pool × 102 entries`
+(`BUFFER_ENTRIES`) — without a reader, `empty_buffers` drains, `irq_work`
+can't refill `lbuffer`, every subsequent NMI bumps `missed`. Correct
+behavior, expected.
 
 Decoded `samples.bin` from Test C: `core=3`, `num_samples=102`, `pid` =
-microbench's pid, `cycles≈51000≈period`, all four GP counters showing
-matching INST_RETIRED.ANY values (the slight drift between counter[0..3]
-within a sample is the handler retiring instructions while reading them
-sequentially — exactly what you'd expect).
+microbench's pid, `cycles≈51000≈period`, four GP counters all reading
+matching INST_RETIRED.ANY values (slight drift between counter[0..3]
+within a sample is just the handler retiring instructions while reading
+them sequentially).
 
-Conclusion: **Subtask 0's irq_work design is structurally sound on a
-single CPU.** The deadlock was a multi-CPU phenomenon.
+**Next step — Subtask 3 (counter expansion to 8 GP + 3 fixed):** still
+on CPU 3 only. Files to touch (per README's "Subtask 3" sketch and the
+prior plan in `~/.claude/plans/this-is-an-old-glistening-walrus.md`):
+- [`module/sample_buffer.h`](module/sample_buffer.h): grow `struct sample`
+  to `gp[8] + fixed[3]`.
+- [`module/intel.c`](module/intel.c): bump `num_ctrs` to 8, write
+  `MSR_CORE_PERF_GLOBAL_CTRL = 0xFF | (7ULL << 32)`,
+  `MSR_CORE_PERF_FIXED_CTR_CTRL = 0x3B3`, add `read_fixed()`.
+- [`module/pmu_sync_sample_main.c`](module/pmu_sync_sample_main.c):
+  extend sysfs attrs to `0..7`, update `gatherSample()` to read 8 GP +
+  3 fixed.
+- [`textreader.cpp`](textreader.cpp): print all 11 counters per row.
 
-**Open follow-ups:**
-1. Diagnose the multi-CPU `dd` lockup. Most likely 4 CPUs' `irq_work`
-   callbacks racing on the `read_queue` wait-queue lock via `wake_up_all`.
-   Quick test: replace `wake_up_all` with `wake_up_interruptible` (single
-   waiter is enough — there's only one `dd` reader), or batch wakes by
-   only calling from one CPU. Other candidates: `append_blist`/`pop_blist`
-   contention on the shared blist locks at 4× rate, scheduler issues from
-   simultaneous cross-CPU `try_to_wake_up`.
-2. The `stopAll()` global-PMU clobber (README issue #2) — out of scope.
+Verification will use the same Test-A/B/C harness: configure 8 events on
+CPU 3, run the microbench, dd a few buffers, decode the binary, sanity-check
+that all 11 counters move and that `gp[0]≈fixed[0]` (INST_RETIRED.ANY vs
+FIXED_CTR0).
 
-**Debug-only changes currently in tree (do not merge to a stable
-release):** `PMU_DEBUG_TARGET_CPU=3` in
-[`module/pmu_sync_sample_main.c`](module/pmu_sync_sample_main.c) and
-the matching CPU-3 guard in
-[`module/intel.c`](module/intel.c)'s NMI handler. Revert both before
-running multi-CPU tests.
+**Out of scope (deferred):**
+- The all-CPU `dd` deadlock at period=50,000. Hypothesis is wake-queue
+  contention from four simultaneous `irq_work` callbacks; not blocking
+  this user's CPU-3-only workflow.
+- The `stopAll()` global-PMU clobber (README issue #2).
 
 ---
 
@@ -370,11 +377,17 @@ sudo rmmod pmu_sync_sample
 All four periods passed: `missed=0` throughout, NMI counter incremented in
 `/proc/interrupts`, no oops/warn/bug, `Interrupts taken` non-zero at exit.
 
-**Open follow-up — the dd hang.** When userspace actively reads
-`/dev/pmu_samples` while sampling at period=50000, all 4 vCPUs lock at 100%
-and SSH dies. Recovery via snapshot revert worked. Not yet diagnosed.
-**Until this is fixed, do NOT proceed to Stage 4 / 5 in this VM.** The
-`post-subtask0` snapshot will not be created until this passes.
+**Single-CPU production target.** The intended workload is
+`taskset -c PMU_TARGET_CPU ./prog`, not all-CPU sampling, so the module
+now arms counters only on `PMU_TARGET_CPU` (defined in
+[`module/pmu_api.h`](module/pmu_api.h), default 3) — `startCtrs`,
+`stopCtrsLocal`, and `dumpCtrs` are dispatched via
+`smp_call_function_single(PMU_TARGET_CPU, ...)`, and the NMI handler in
+[`module/intel.c`](module/intel.c) returns `NMI_DONE` on every other CPU
+so unrelated NMIs (watchdog/kgdb) still propagate. Single-CPU sampling
+at the paper's period=50,000 is verified clean even with concurrent
+`dd` reads (see "Single-CPU verification on CPU 3" above). The all-CPU
+dd-induced lockup is out of scope for this user's workflow.
 
 ### Out of scope for this subtask
 The second README issue (`stopAll()` clobbers global PMU state on every CPU

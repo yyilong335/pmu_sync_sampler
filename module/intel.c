@@ -64,9 +64,9 @@ static int my_nmi_handler(unsigned int cmd, struct pt_regs *regs)
 {
     size_t i;
 
-    /* DEBUG: only CPU 3 has counters armed; ignore NMIs from anywhere else
-     * so the watchdog / kgdb path still gets them. */
-    if (smp_processor_id() != 3)
+    /* Only the target CPU has counters armed; let NMIs on any other CPU
+     * fall through to the watchdog / kgdb / etc. handlers. */
+    if (smp_processor_id() != PMU_TARGET_CPU)
         return NMI_DONE;
 
     total_interrupts += 1;
