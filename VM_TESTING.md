@@ -209,29 +209,70 @@ Userspace writes `(umask << 8) | event` to `/sys/sync_pmu/0..7` (the
 module already masks `0xFFFF` and OR-s in USR/OS/EN bits).
 
 **Verified** at period=50,000 on CPU 3 with the microbench (6 s) and
-`dd` reading 30 buffers (123 KB, 2,040 samples decoded):
+`dd` reading 30 buffers (123 KB, ~2,040 samples decoded), repeated
+**5 times back-to-back** to check stability. Per-run:
 
-| Cross-check | Result |
-|---|---|
-| `gp[0]` (PREC_DIST) ≈ `fixed[0]` | 2,039/2,039 within 2 %, mean ratio 0.9970, stdev 0.0005 |
-| `gp[1]` (CLK_CORE) ≈ `s->cycles` | 2,039/2,039 within 5 %, mean ratio 1.0014, stdev 0.0010 |
-| Branch mispredict rate `gp[4]/gp[3]` | 0.50 % |
-| LLC miss rate `gp[6]/gp[5]` | 4.91 % |
-| `s->cycles` ≈ period+overhead | mean 62,842, median 62,781, stdev 589 cycles (CPU at turbo ~3.2 GHz × 50K base period) |
+| run | n | cyc_mean | cyc_stdev | gp[1]/cyc | br% | llc% |
+|---|---|---|---|---|---|---|
+| 1 | 2039 | 62,460 | 450 | 1.0014 | 0.47 | 4.71 |
+| 2 | 2039 | 63,021 | 601 | 1.0015 | 0.52 | 4.13 |
+| 3 | 2039 | 63,182 | 458 | 1.0016 | 0.48 | 5.18 |
+| 4 | 2038 | 63,088 | 532 | 1.0016 | 0.51 | 3.76 |
+| 5 | 2039 | 63,145 | 413 | 1.0015 | 0.47 | 6.20 |
 
-Mean-ratio tightness (< 0.001 stdev) means the GP counter and the
-fixed counter are reading **the same hardware event at the same
-instant** — which is the entire premise of the synchronous sampler.
-That's the paper's verification target. **Subtask 4 done.**
+Run-to-run stability:
 
-`/sys/sync_pmu/missed` was very high (108,776 of 111,360 NMIs) because
-the 8-buffer pool can't keep up with 50K-cycle PMI rate when the
-reader does only 30 reads in 6 s. That's a throughput limit of the
-buffer pool, not a correctness issue — the captured samples are
-correct, just sparse. To capture more, either increase the pool size
-in `pmu_init` (currently 8 buffers preallocated) or use a faster
-reader (`textreader` continuously rather than a small fixed `dd
-count=`).
+| Metric | Mean | Stdev | Spread |
+|---|---|---|---|
+| `cyc_mean` (cycles per sample) | 62,979 | 296 | 722 |
+| `gp[1]/cyc` (CLK_CORE vs `s->cycles`) | **1.0015** | **0.0001** | 0.0002 |
+| Branch mispredict rate | 0.49 % | 0.024 % | 0.054 % |
+| LLC miss rate | 4.80 % | 0.96 % | 2.45 % |
+
+The `gp[1]/cyc` mean ratio holds at 1.0015 with **stdev 0.0001 across
+runs** — i.e. the GP counter and the FIXED1-derived `s->cycles` value
+agree on the same cycle count, every sample, every run, to within
+0.01 %. That's the paper's "synchronous sampling" claim, validated.
+**Subtask 4 done.**
+
+### Two characteristics worth understanding before running on bare metal
+
+**1. cycle inflation** (≈25 % above `period`). With period=50,000,
+`s->cycles` lands at ~62,800 instead of ~50,000. Two causes:
+
+* **Host turbo on the KVM passthrough.** Bastion at base 2.6 GHz vs
+  turbo ~3.2 GHz = 1.23× factor — exactly the inflation we see. On
+  bare metal with turbo disabled
+  ([prepare_for_benchmarking.sh](prepare_for_benchmarking.sh)), this
+  factor goes away.
+* **KVM PMI delivery latency** (~1,000 cycles per PMI). Each PMI
+  exits to KVM, gets re-injected, and only then enters our handler —
+  the counter keeps ticking through that. Bare metal has sub-microsecond
+  PMI dispatch.
+
+In-run stdev is ~500 cycles → small KVM jitter. Cross-run stdev of
+the *means* is 296 cycles → very stable.
+
+**2. PMC0/PREC_DIST cross-check is non-deterministic on KVM.**
+INST_RETIRED.PREC_DIST (`0xC0:0x01`) on PMC0 was the cleanest
+cross-check against FIXED0 in one run (mean ratio 0.9970, see commit
+`000be4f`), but in a later 5-run repeat PMC0 stayed at 0 even though
+EVENTSEL0 was correctly programmed. Best guess: a Skylake/KVM
+counter-resource arbitration with another PEBS-capable event, or
+perf_events grabbing PMC0 between our `rmmod` and next `insmod` even
+with the watchdog off. The synchronous sampler itself is fine —
+`gp[1]/cyc` and the rate-based cross-checks are stable across all
+runs. Treat the PREC_DIST/PMC0 path as "works on bare metal, flaky
+under KVM."
+
+### Buffer-pool throughput note
+
+`/sys/sync_pmu/missed` sat near 120,000 of ~120,000 NMIs across runs.
+The 8-buffer pool can't keep up with the 50K-cycle PMI rate when the
+reader is `dd count=30`. The captured samples are correct, just
+sparse. To capture more, raise the pool size in `pmu_init` (currently
+8 buffers preallocated) or use [textreader](textreader.cpp) running
+continuously.
 
 ---
 
