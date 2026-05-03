@@ -1,156 +1,237 @@
-# VM-based execution plan for Subtasks 0 / 2 / 3 / 4
+# pmu_sync_sampler — kernel-5.15 modernization plan
 
-## Why this document exists
+## What we're building
 
-The first attempt to run this module on the modern host (Linux 5.15, Xeon Gold
-6142, SMT off) hard-locked the machine. The latent NMI/spinlock deadlock
-documented in [README.md](README.md#-known-crash-risk--do-not-load-on-shared-infrastructure)
-is consistent with that crash. From here, all kernel work happens inside a
-throwaway KVM guest so a deadlock costs only `virsh destroy`, not a
-power-cycle.
+The original module (last touched on Linux 2.6.32 / Nehalem) samples Intel PMU
+counters synchronously — every PMI reads the same counters at the same instant
+on the same core. The goal is to bring it back to life on Linux 5.15 / Xeon
+Gold 6142 (Skylake-SP, SMT off) and reach the paper's verification target:
+**11 counters (8 GP + 3 fixed) sampled every 50,000 cycles on a single
+production core (CPU 3)**, while a `taskset -c 3 ./prog` workload runs on it.
 
-This plan covers VM provisioning and a staged, risk-ascending execution of the
-four kernel-side subtasks. Code-level diffs for Subtasks 2 / 3 / 4 are sketched
-in the README's "Status & known issues" section; this doc adds **Subtask 0**
-(the NMI/spinlock fix) which the README flags as a prerequisite to safe use
-but does not design.
+All kernel work happens inside a throwaway KVM guest with full PMU
+passthrough. A deadlock in the module hangs only the guest, recoverable in
+seconds via `virsh snapshot-revert`. This document is the live status of
+that work — read top-to-bottom for the big picture, jump to a specific
+subtask section for details.
 
-Three decisions captured up front:
-1. Fix the NMI/spinlock deadlock as **Subtask 0** before running Subtask 4 at
-   the paper's 50,000-cycle period. Doing it inside the VM is safe and is also
-   the prerequisite to ever returning to bare metal.
-2. Get the source into the guest by `git clone` from inside the guest
-   (no virtfs / 9p share).
-3. **Production target is single-CPU sampling, not all-CPU.** The user's
-   actual workload is `taskset -c 3 ./program` and only needs PMU samples
-   from CPU 3 while that program runs. So the module is configured to arm
-   counters on CPU 3 only (`PMU_DEBUG_TARGET_CPU = 3`); the all-CPU dd
-   contention bug seen during early testing is therefore out of scope.
+## Subtasks at a glance
+
+| # | Subtask | Status | Commit |
+|---|---|---|---|
+| 1 | Build & load on Linux 5.15 (kernel-API modernization) | ✓ done | [`39deb74`](../../commit/39deb74) |
+| 2 | udev-managed `/dev/pmu_samples` (drop hardcoded major 222) | ✓ done | [`7a59465`](../../commit/7a59465) |
+| — | x2APIC fix: `apic_write` for LVTPC programming *(pre-existing bug)* | ✓ done | [`e33ca6d`](../../commit/e33ca6d) |
+| 0 | NMI/spinlock deadlock fix via `irq_work`, scoped to CPU 3 | ✓ done | [`c2eb4b6`](../../commit/c2eb4b6) → [`e965a5b`](../../commit/e965a5b) |
+| 3 | Expand to 8 GP + 3 fixed counters (CPU 3 only) | **next** | — |
+| 4 | Paper-style verification at period=50,000 (CPU 3 only) | not started | — |
+
+Numbering follows the README's original plan; **Subtask 0** is the
+NMI/spinlock fix the README flagged as a prerequisite but did not design.
+The order of execution is 2 → 0 → 3 → 4 (deliberately
+risk-ascending — Subtask 2 doesn't enable sampling, Subtask 0 makes
+sampling safe to enable, Subtasks 3/4 expand and validate it).
+
+## Where to test, which version to use
+
+- **Repository branch:** `kernel-5.15`. Latest commit `e965a5b` (or
+  whichever is the head when you `git fetch`).
+- **Guest VM:** Ubuntu 22.04 cloud image, 4 vCPU, 4 GB RAM,
+  `--cpu host-passthrough`. The guest sees the host's full architectural
+  PMU (8 GP + 3 fixed, 48-bit) — same as bare-metal bastion.
+- **Sync workflow:** edit on bastion, commit, push to
+  `origin/kernel-5.15`, `git pull` on the guest. The guest is a real
+  `git clone` of `kernel-5.15` (no more `scp`-driven drift).
+- **What to run for a smoke test:**
+  ```bash
+  cd ~/pmu_sync_sampler/module && make
+  sudo insmod pmu_sync_sample.ko
+  ls /sys/sync_pmu/                         # 0..3 missed period status
+  ls -l /dev/pmu_samples                    # major != 222
+  sudo rmmod pmu_sync_sample
+  ```
+  Then for sampling: see "Test harness" below.
 
 ---
 
-## Execution status
+## Subtask details
 
-What has actually been done / what's outstanding, kept current as work
-proceeds. This section is the source of truth on progress; the rest of the
-document is the recipe.
+### Subtask 1 — kernel-API modernization (done)
 
-| Stage | What | State |
-|---|---|---|
-| Phase A–D | Host prep, VM provisioning, snapshot of clean built guest | ✓ done |
-| Stage 1 | Smoke insmod / rmmod, no sampling | ✓ done |
-| Stage 2 / Subtask 2 | udev cdev replaces hardcoded major 222 | ✓ done, committed |
-| Pre-existing bug | `native_apic_mem_write` silently no-ops under x2APIC; PMI never reached the NMI vector. Three call sites in `module/intel.c` switched to mode-agnostic `apic_write()`. | ✓ patched in working tree |
-| Stage 3 / Subtask 0 | irq_work-based NMI safety on CPU 3 (production target) | ✓ **done.** With CPU-3-only sampling and a [microbench](microbench.c) busy-loop on CPU 3, `dd` reads run concurrently at the paper's period=50,000 cadence — no hang, no oops, decoded samples have `core=3`, `cycles≈period`, plausible INST_RETIRED counts. |
-| Stage 4 / Subtask 3 | Expand to 8 GP + 3 fixed counters (CPU 3 only) | next up |
-| Stage 5 / Subtask 4 | 50,000-cycle paper-style verification on CPU 3 | not started |
+Replaced 2.6.32-era APIs that were deprecated or removed by 5.15:
+`register_die_notifier` → `register_nmi_handler(NMI_LOCAL, …)`,
+`<asm/uaccess.h>` → `<linux/uaccess.h>`, `kobj_type.default_attrs` →
+`default_groups` via `ATTRIBUTE_GROUPS()`, named
+`pmu_init`/`pmu_exit` + `module_init`/`module_exit`. The ARM/OMAP4
+port (now-dead `mach-omap2` headers) was dropped. See
+[README.md](README.md) "Done so far" section for the full list. No
+behavior change; module builds clean, loads, and unloads.
 
-**Snapshots in libvirt:**
-- `clean-build` — toolchain installed, repo built, no insmod yet.
-- `post-subtask2` — Subtask 2 verified.
-- *(`post-subtask0` to be created after the next clean run; safe to take now.)*
+### Subtask 2 — udev-managed char device (done)
 
-**Single-CPU verification on CPU 3:**
+Replaced `register_chrdev(222, "pmu_samples", &my_fops)` with
+`alloc_chrdev_region` + `cdev_init`/`cdev_add` +
+`class_create("pmu_samples")` + `device_create(...)`. udev now creates
+`/dev/pmu_samples` on insmod (kernel-allocated major) and removes it on
+rmmod. The matching `mknod /dev/pmu_samples c 222 0` block in
+[`example_run.sh`](example_run.sh) was deleted.
 
-Three tests at period=100,000 and 50,000 (paper cadence), all clean:
+### x2APIC LVTPC fix (done — discovered while testing Subtask 0)
 
-| Test | Period | Workload | NMIs on CPU 3 | Captured | `missed` | dd reads |
-|---|---|---|---|---|---|---|
-| A | 100,000 | microbench, no dd | 100,712 | 816 (= 8×102) | 99,896 | n/a |
-| B | 100,000 | microbench + dd 10 buffers | 120,383 | 1,836 | 118,547 | OK (40 KB) |
-| C | 50,000 (paper) | microbench + dd 20 buffers | 174,171 | 2,856 | 171,315 | OK (80 KB) |
+The original code programmed the local APIC's `LVTPC` register with
+`native_apic_mem_write(APIC_LVTPC, APIC_DM_NMI)`. That writes to the
+xAPIC MMIO window (`0xFEE00xxx`). **Modern KVM and modern bare-metal
+Skylake-SP both default to x2APIC, where MMIO APIC access is silently
+no-op'd** — the PMI fires on FIXED_CTR1 overflow but never reaches the
+NMI vector. First arming-the-handler test in the guest exposed this:
+`Interrupts taken: 0`, `GLOBAL_STATUS` bit 33 set (overflow latched)
+but no NMI in `/proc/interrupts`. Three call sites in
+[`module/intel.c`](module/intel.c) switched to `apic_write(...)`, which
+dispatches via `apic->write` and works in both modes.
 
-Test A's captured count exactly matches `8 buffer-pool × 102 entries`
-(`BUFFER_ENTRIES`) — without a reader, `empty_buffers` drains, `irq_work`
-can't refill `lbuffer`, every subsequent NMI bumps `missed`. Correct
-behavior, expected.
+This is also the most likely cause of the original bastion hard-lock —
+on xAPIC the MMIO write happened to land on the actual APIC register
+(by coincidence of identity-mapping), so the original 2.6.32 code
+"worked"; on x2APIC the write goes nowhere and any subsequent code that
+assumes NMIs are firing wedges the kernel.
 
-Decoded `samples.bin` from Test C: `core=3`, `num_samples=102`, `pid` =
-microbench's pid, `cycles≈51000≈period`, four GP counters all reading
-matching INST_RETIRED.ANY values (slight drift between counter[0..3]
-within a sample is just the handler retiring instructions while reading
-them sequentially).
+### Subtask 0 — NMI/spinlock deadlock fix (done)
 
-**Next step — Subtask 3 (counter expansion to 8 GP + 3 fixed):** still
-on CPU 3 only. Files to touch (per README's "Subtask 3" sketch and the
-prior plan in `~/.claude/plans/this-is-an-old-glistening-walrus.md`):
+**Root cause** (pre-existing). `gatherSample()` ran in NMI context but
+called `pop_blist`/`append_blist`, which take a regular `spinlock_t`
+via `spin_lock_irqsave`. NMIs are not masked by `irqsave` (they're the
+*Non*-Maskable Interrupt — that's a hardware property), so an NMI
+delivered while `my_read` held the lock would spin forever in the
+handler waiting for the very thread it preempted to release the lock.
+
+**Fix** (this branch). `gatherSample()` is now lock-free in NMI
+context: it writes one sample to the per-CPU `lbuffer`, and when that
+buffer fills it stashes the buffer in a per-CPU `pending_full` slot,
+NULLs `lbuffer`, and calls `irq_work_queue()`. The `irq_work` callback
+runs in normal IRQ context (where `spin_lock_irqsave` is correct) and
+does the actual `pop_blist`/`append_blist` and `wake_up_all`. If a
+later NMI arrives before the irq_work refills `lbuffer`, the sample is
+dropped (`missed++`) — the same semantics as the existing `missed`
+counter. `startCtrs` pre-fills `lbuffer` so the very first NMI doesn't
+auto-miss; `pmu_exit` calls `irq_work_sync` per-CPU before draining
+state.
+
+**CPU 3 scoping.** Production workload is `taskset -c 3 ./prog`, so we
+only need samples from CPU 3. `process_status_update` and `stopAll`
+dispatch via `smp_call_function_single(PMU_TARGET_CPU, ...)` (defined in
+[`module/pmu_api.h`](module/pmu_api.h), default 3); the NMI handler
+returns `NMI_DONE` on any other CPU so unrelated NMIs (watchdog/kgdb)
+still propagate. To retarget to a different core, change `PMU_TARGET_CPU`
+in `pmu_api.h` and rebuild — nothing else needs to move.
+
+**Verified** at the paper cadence (period=50,000) on CPU 3 with the
+microbench providing real load and `dd` reading samples concurrently —
+no hang, no oops, decoded samples look right (`cycles≈period`,
+INST_RETIRED counts plausible). Test results in "Test harness" below.
+
+**Out of scope (not blocking this user's workflow):** all-CPU sampling
+at period=50,000 + concurrent `dd` deadlocked all 4 vCPUs in earlier
+testing. Most likely the four `irq_work` callbacks contend on the
+`read_queue` wait-queue lock via `wake_up_all`. Not pursued.
+
+### Subtask 3 — counter expansion to 8 GP + 3 fixed (next)
+
+Goal: sample all 11 counters synchronously on every PMI on CPU 3, not
+just 4 GP + 1 fixed.
+
+**Files to touch:**
+
 - [`module/sample_buffer.h`](module/sample_buffer.h): grow `struct sample`
-  to `gp[8] + fixed[3]`.
-- [`module/intel.c`](module/intel.c): bump `num_ctrs` to 8, write
-  `MSR_CORE_PERF_GLOBAL_CTRL = 0xFF | (7ULL << 32)`,
-  `MSR_CORE_PERF_FIXED_CTR_CTRL = 0x3B3`, add `read_fixed()`.
+  to `cycles + pid + gp[8] + fixed[3]` (40 → 60 bytes; `BUFFER_ENTRIES`
+  recomputes from `(BUFFER_SIZE - 12) / sizeof(struct sample)` to ~68).
+- [`module/intel.c`](module/intel.c):
+  - Bump `num_ctrs` to 8.
+  - `MSR_CORE_PERF_GLOBAL_CTRL` ← `0xFF | (7ULL << 32)` (PMC0..7 +
+    FIXED0..2 enabled).
+  - `MSR_CORE_PERF_FIXED_CTR_CTRL` ← `0x3B3` (FIXED0 OS|USR=3, FIXED1
+    OS|USR|PMI=0xB, FIXED2 OS|USR=3).
+  - Add `read_fixed(unsigned i)` returning `MSR_ARCH_PERFMON_FIXED_CTR0+i`.
+  - Widen the overflow-clear mask in `my_nmi_handler`.
 - [`module/pmu_sync_sample_main.c`](module/pmu_sync_sample_main.c):
-  extend sysfs attrs to `0..7`, update `gatherSample()` to read 8 GP +
-  3 fixed.
+  - Add sysfs attrs `4`..`7` (existing has `0`..`3`).
+  - `gatherSample()`: read 8 GP into `s->gp[]`, 3 fixed into `s->fixed[]`.
+  - `startCtrs()` builds `cfgs[0..7]` from the 8 sysfs attrs.
 - [`textreader.cpp`](textreader.cpp): print all 11 counters per row.
 
-Verification will use the same Test-A/B/C harness: configure 8 events on
-CPU 3, run the microbench, dd a few buffers, decode the binary, sanity-check
-that all 11 counters move and that `gp[0]≈fixed[0]` (INST_RETIRED.ANY vs
-FIXED_CTR0).
+**Verification:** reuse the Test A/B/C harness. Configure 8 events,
+microbench on CPU 3, `dd` a few buffers, decode the binary. Sanity
+check: all 11 counters non-zero with the right ordering;
+`gp[0]≈fixed[0]` if event 0 is INST_RETIRED.ANY (architectural — `gp`
+counts the same thing FIXED0 counts).
 
-**Out of scope (deferred):**
-- The all-CPU `dd` deadlock at period=50,000. Hypothesis is wake-queue
-  contention from four simultaneous `irq_work` callbacks; not blocking
-  this user's CPU-3-only workflow.
-- The `stopAll()` global-PMU clobber (README issue #2).
+### Subtask 4 — paper-style verification at period=50,000 (not started)
+
+Configure these 8 architectural events on CPU 3 (encodings stable
+across all Intel generations from Skylake-SP through Alder Lake):
+
+| Idx | Event:Umask | Meaning | Cross-check |
+|---|---|---|---|
+| 0 | `0xC0:0x00` | INST_RETIRED.ANY | vs FIXED0 |
+| 1 | `0x3C:0x00` | CPU_CLK_UNHALTED.CORE | vs FIXED1 |
+| 2 | `0x3C:0x01` | CPU_CLK_UNHALTED.REF | vs FIXED2 |
+| 3 | `0xC4:0x00` | BR_INST_RETIRED.ALL | — |
+| 4 | `0xC5:0x00` | BR_MISP_RETIRED.ALL | rate `gp4/gp3` |
+| 5 | `0x2E:0x4F` | LONGEST_LAT_CACHE.REFERENCE | — |
+| 6 | `0x2E:0x41` | LONGEST_LAT_CACHE.MISS | rate `gp6/gp5` |
+| 7 | `0xC0:0x01` | INST_RETIRED.PREC_DIST | — |
+
+Userspace writes `(umask << 8) | event` to `/sys/sync_pmu/0..7` (the
+module already masks `0xFFFF` and OR-s in USR/OS/EN bits).
+
+Pass criteria, all within ~2% on a 5-second microbench run:
+`fixed1 ≈ 50,000` per sample, `gp[0] ≈ fixed[0]`, `gp[1] ≈ fixed[1]`,
+`gp[2] ≈ fixed[2]`, branch-mispredict rate single-digit percent,
+`/sys/sync_pmu/missed` not exploding.
 
 ---
 
-## Phase A — Host preparation (one-time)
+## Setup recipe — VM from scratch
 
-Goal: confirm the host can run a KVM guest with PMU passthrough, install the
-libvirt stack.
+This is the one-time path to get a working KVM guest. Skip to "Test
+harness" if your guest is already built.
+
+### 1. Host preparation (once per host)
 
 ```bash
-# Verify CPU virtualization extensions
-grep -Ec '(vmx|svm)' /proc/cpuinfo     # > 0 expected
-lsmod | grep -E '^kvm'                 # kvm_intel or kvm_amd loaded
+# Confirm KVM is usable
+grep -Ec '(vmx|svm)' /proc/cpuinfo     # > 0
 ls /dev/kvm                            # exists
-
-# Confirm host is not itself a VM, or that nested virt is enabled
-systemd-detect-virt                    # 'none' on bare metal
-cat /sys/module/kvm_intel/parameters/nested 2>/dev/null   # Y if nested
+id | grep -E 'kvm|libvirt'             # both groups (ask sysadmins on shared host)
 
 # Install libvirt + tooling
-sudo apt update
 sudo apt install -y qemu-kvm libvirt-daemon-system libvirt-clients \
-                    virtinst cloud-image-utils virt-manager bridge-utils
-sudo usermod -aG libvirt,kvm $USER
-# log out/back in for group membership to apply
-id | grep -E 'kvm|libvirt'             # both present
-python3 -c "open('/dev/kvm','rb').close()" && echo "kvm readable"
-virsh -c qemu:///system list --all     # libvirtd reachable
+                    virtinst cloud-image-utils virt-manager
 ```
 
-**Common gotcha — KVM acceleration silently unavailable.** If `virt-install`
-prints `WARNING  KVM acceleration not available, using 'qemu'`, you've fallen
-back to TCG software emulation. **TCG does not faithfully model the
-architectural PMU MSRs this module reads — your VM testing is meaningless
-in that mode.** Almost always caused by missing `kvm` group membership; fix
-that first.
+If `virt-install` later prints `KVM acceleration not available, using 'qemu'`,
+you've fallen back to TCG software emulation — **the guest's PMU won't be
+real** and any test result is meaningless. Almost always missing `kvm` group;
+fix that first.
 
-## Phase B — Provision the guest (cloud-image + cloud-init)
+### 2. Provision the guest (cloud-image flow)
 
-Goal: a 4-vCPU Ubuntu guest with `host-passthrough` so the architectural PMU
-is exposed.
-
-> The legacy `--location http://archive.ubuntu.com/ubuntu/dists/jammy/main/installer-amd64/`
-> path no longer has a bootable kernel/initrd — Ubuntu's server installer is
-> Subiquity now. Use the cloud image flow below instead.
+The README's old `--location http://archive.ubuntu.com/...installer-amd64/`
+URL no longer has bootable kernel/initrd files — Ubuntu's server installer
+is Subiquity now. Use a cloud image instead:
 
 ```bash
-mkdir -p ~/vm && cd ~/vm
+VMDIR=/var/tmp/kbh8sa-pmu-vm           # local disk; libvirt-qemu can't read NFS homes
+mkdir -p $VMDIR && chgrp kvm $VMDIR && chmod 750 $VMDIR
+cd $VMDIR
 
-# 1. Download the cloud image (jammy = 22.04, noble = 24.04)
-DIST=jammy   # or noble
-wget -O ${DIST}-cloudimg.qcow2 \
-  https://cloud-images.ubuntu.com/${DIST}/current/${DIST}-server-cloudimg-amd64.img
-qemu-img resize ${DIST}-cloudimg.qcow2 +13G
+# Cloud image + cloud-init seed
+wget -O jammy-cloudimg.qcow2 \
+  https://cloud-images.ubuntu.com/jammy/current/jammy-server-cloudimg-amd64.img
+qemu-img resize jammy-cloudimg.qcow2 +13G
 
-# 2. Build a cloud-init seed: user, SSH password, packages
 cat > user-data <<'EOF'
 #cloud-config
+hostname: pmu-test
 users:
   - name: ubuntu
     plain_text_passwd: ubuntu
@@ -169,312 +250,115 @@ EOF
 echo "instance-id: pmu-test-1" > meta-data
 cloud-localds seed.iso user-data meta-data
 
-# 3. Launch via libvirt system mode (NAT bridge → routable from host)
 virt-install \
   --connect qemu:///system \
   --name pmu-test --memory 4096 --vcpus 4 \
   --cpu host-passthrough,topology.sockets=1,topology.cores=4,topology.threads=1 \
-  --disk path=$HOME/vm/${DIST}-cloudimg.qcow2,format=qcow2,bus=virtio \
-  --disk path=$HOME/vm/seed.iso,device=cdrom \
+  --disk path=$VMDIR/jammy-cloudimg.qcow2,format=qcow2,bus=virtio \
+  --disk path=$VMDIR/seed.iso,device=cdrom \
   --import --os-variant ubuntu22.04 \
   --network network=default,model=virtio \
   --graphics none --noautoconsole
 
-# 4. Find the guest IP and SSH in
-virsh -c qemu:///system domifaddr pmu-test     # wait ~30s for cloud-init
-ssh ubuntu@<ip>                                 # password: ubuntu
+# Find guest IP
+virsh -c qemu:///system domifaddr pmu-test
+ssh ubuntu@<ip>        # password: ubuntu
 ```
 
-Inside the guest, confirm the PMU was passed through:
+Inside the guest, confirm PMU passthrough:
 
 ```bash
-dmesg | grep -i 'perf\|pmu' | head -20
-# Expect: "Performance Events: ..., N GP, 3 fixed"
+sudo dmesg | grep -i 'perf\|pmu' | head
+sudo apt install -y cpuid msr-tools
+cpuid -1 -l 0xa -r     # EDX low 5 bits = #fixed counters; expect 3
 ```
 
-**Tolerance:** KVM frequently exposes only 4 GP counters to the guest even on
-a host with 8. That's enough to validate the code path; final 8-counter
-validation can wait for bare metal once Subtask 0 has made bare metal safe.
-
-## Phase C — Guest toolchain & source
+### 3. Get the source into the guest
 
 ```bash
-# (cloud-init already installed build-essential, linux-headers-generic, git, libboost-dev)
-git clone https://github.com/yyilong335/pmu_sync_sampler.git ~/pmu_sync_sampler
-cd ~/pmu_sync_sampler/module
-make                                   # produces pmu_sync_sample.ko
+git clone -b kernel-5.15 \
+  https://github.com/yyilong335/pmu_sync_sampler.git ~/pmu_sync_sampler
+cd ~/pmu_sync_sampler/module && make
+gcc -O2 -Wall -o ../microbench ../microbench.c
 ```
 
-## Phase D — Snapshot the clean guest
+### 4. Snapshot a clean state
 
-Cheap rollback point. Create after Phase C, before any `insmod`.
+From the **host**:
 
 ```bash
-# On the host
 virsh -c qemu:///system shutdown pmu-test
 virsh -c qemu:///system snapshot-create-as pmu-test clean-build \
-    "Toolchain installed, repo cloned, module built, no insmod yet"
+    "Toolchain installed, repo cloned, module built"
 virsh -c qemu:///system start pmu-test
 ```
 
-Recovery procedure (host) any time the guest hangs:
+Recovery from this snapshot any time the guest hangs:
 
 ```bash
-virsh -c qemu:///system destroy pmu-test                     # force off
+virsh -c qemu:///system destroy pmu-test
 virsh -c qemu:///system snapshot-revert pmu-test clean-build
 virsh -c qemu:///system start pmu-test
 ```
 
 ---
 
-## Stage 1 — Smoke-test the existing module (no sampling)
+## Test harness
 
-Goal: confirm Subtask 1's modernization works inside the guest before
-touching anything.
+Two userspace pieces work together with the module:
 
-```bash
-# In guest
-sudo insmod ~/pmu_sync_sampler/module/pmu_sync_sample.ko
-dmesg | tail -20                       # init banner
-ls /sys/sync_pmu/                      # 0 1 2 3 missed period status
-sudo rmmod pmu_sync_sample
-dmesg | tail -5                        # clean exit
-```
+- [`microbench.c`](microbench.c) — pinned to CPU 3, runs a tight ALU loop
+  for N seconds (default 10). Provides a deterministic workload so
+  `FIXED_CTR1` actually ticks and the PMI rate approaches its rated
+  cadence.
+- `dd if=/dev/pmu_samples ...` (or
+  [`textreader.cpp`](textreader.cpp)) — drains `full_buffers` from
+  userspace so the buffer pool doesn't saturate.
 
-**Do not** write `1` to `/sys/sync_pmu/status` yet — that arms the buggy NMI
-path.
-
-If Stage 1 fails to build/load, the issue is in already-merged Subtask 1 code
-and must be fixed before continuing. On kernels ≥ 6.2 you should still be
-fine here (Subtask 1 already migrated `default_attrs` → `default_groups`).
-
-## Stage 2 — Subtask 2: udev-managed char device
-
-Goal: replace `register_chrdev(222, ...)` with `alloc_chrdev_region` + `cdev`
-+ `class`/`device` so udev creates `/dev/pmu_samples` automatically.
-
-Risk: very low — affects init/exit paths only, sampling is never enabled in
-this stage.
-
-Critical files:
-- [module/pmu_sync_sample_main.c:395](module/pmu_sync_sample_main.c#L395) — `register_chrdev` call site
-- [module/pmu_sync_sample_main.c:419](module/pmu_sync_sample_main.c#L419) — `unregister_chrdev` call site
-- [example_run.sh:14](example_run.sh#L14) — remove the `mknod /dev/pmu_samples c 222 0` line
-
-```c
-// Sketch — kernel 5.15 form. See "Kernel-version notes" below for 6.4+.
-static dev_t   pmu_dev;
-static struct cdev   pmu_cdev;
-static struct class *pmu_class;
-
-alloc_chrdev_region(&pmu_dev, 0, 1, "pmu_samples");
-cdev_init(&pmu_cdev, &my_fops);
-cdev_add(&pmu_cdev, pmu_dev, 1);
-pmu_class = class_create(THIS_MODULE, "pmu_samples");   // 5.15 signature
-device_create(pmu_class, NULL, pmu_dev, NULL, "pmu_samples");
-```
-
-Verify in guest:
-
-```bash
-cd ~/pmu_sync_sampler/module && make && sudo insmod pmu_sync_sample.ko
-ls -l /dev/pmu_samples                 # exists, kernel-allocated major (not 222)
-sudo rmmod pmu_sync_sample
-ls -l /dev/pmu_samples                 # gone
-sudo insmod pmu_sync_sample.ko && sudo rmmod pmu_sync_sample   # round-trip
-```
-
-Commit + push from the guest, refresh snapshot to `post-subtask2`.
-
-## Stage 3 — Subtask 0 (new): fix the NMI/spinlock deadlock
-
-Goal: stop the NMI handler from taking a regular spinlock that the read path
-also holds. Without this, Stage 5 (period=50000) is expected to deadlock.
-
-**Root cause** (verified in the code):
-- NMI path: [module/intel.c:70](module/intel.c#L70) → `gatherSample()` at
-  [module/pmu_sync_sample_main.c:209-238](module/pmu_sync_sample_main.c#L209-L238)
-  → `pop_blist`/`append_blist` (lines 216, 234) which `spin_lock_irqsave` on
-  the `blist.lock` at
-  [module/pmu_sync_sample_main.c:23-27](module/pmu_sync_sample_main.c#L23-L27).
-- Read path: `my_read()` (lines 116–147) acquires the same locks at lines 130
-  and 144.
-- `irqsave` does **not** mask NMIs. An NMI delivered while the read path
-  holds the lock will spin forever in `pop_blist`.
-
-**Approach: defer the buffer hand-off out of NMI context using `irq_work`.**
-Smallest change that closes the race; keeps the existing list/buffer logic
-untouched.
-
-1. **NMI handler stays minimal.** Writes one `struct sample` into the
-   per-CPU "current buffer" (no list lock — the per-CPU current pointer is
-   owned by the CPU). Only consults the lock-protected blists when the
-   current buffer is full.
-2. **When the per-CPU buffer fills**, the NMI handler:
-   - Flips a per-CPU `needs_swap` flag.
-   - Calls `irq_work_queue(this_cpu_ptr(&pmu_irqwk))`.
-   - Returns. Subsequent NMIs that fire before the irq_work runs see
-     `needs_swap` already set and increment `missed` (mirrors existing
-     semantics).
-3. **The irq_work callback** runs in normal IRQ context, so
-   `spin_lock_irqsave` is safe. It:
-   - `pop_blist(&empty_buffers)` to grab a new empty.
-   - Swaps the per-CPU current pointer.
-   - `append_blist(&full_buffers, old_full)`.
-   - Clears `needs_swap`.
-   - `wake_up_all(&read_queue)`.
-
-Files to touch (small, surgical):
-- [module/pmu_sync_sample_main.c](module/pmu_sync_sample_main.c): add
-  `<linux/irq_work.h>`, define a per-CPU `struct irq_work pmu_irqwk` and the
-  callback. Move `pop_blist`/`append_blist`/`wake_up_all` out of
-  `gatherSample()` into the callback.
-- [module/intel.c](module/intel.c): no signature change for the NMI handler;
-  `my_nmi_handler` still calls `gatherSample()`, which is now lock-free.
-
-### Pre-existing bug surfaced during Subtask 0 testing — x2APIC LVTPC
-
-The original code programs the local APIC's `LVTPC` register with
-`native_apic_mem_write(APIC_LVTPC, APIC_DM_NMI)`. That writes through the
-xAPIC MMIO window (`0xFEE00xxx`). **Modern KVM and modern bare-metal
-Skylake-SP both default to x2APIC, where MMIO APIC access is silently
-no-op'd — the PMI is generated by FIXED_CTR1 overflow but never reaches the
-NMI vector.** First testing of Subtask 0 in the guest exposed this:
-`Interrupts taken: 0`, `GLOBAL_STATUS` bit 33 set (overflow latched), but no
-NMIs in `/proc/interrupts`.
-
-Fix: replace all three call sites with `apic_write(...)` (the mode-agnostic
-dispatcher that does the right thing on xAPIC and x2APIC alike).
-
-This is also almost certainly the original cause of the bastion crash — on
-xAPIC hardware the MMIO write happened to land on the actual APIC register
-(by coincidence of identity-mapping), so the original 2.6.32 code "worked";
-on x2APIC the write goes nowhere, leaving counters running with no PMI
-delivery, and any subsequent module behaviour that assumes the NMI is firing
-(such as the existing buffer hand-off via `wake_up_all` from inside
-`gatherSample`) ends up confusing the kernel.
-
-### Verification (in guest)
-
-What actually passed in testing:
+Standard Subtask 0 verification run:
 
 ```bash
 sudo insmod ~/pmu_sync_sampler/module/pmu_sync_sample.ko
 for i in 0 1 2 3; do echo $((0xC0)) | sudo tee /sys/sync_pmu/$i; done
-# Period escalation: 10ms, 1ms, 0.1ms, 50µs (paper cadence)
-for p in 10000000 1000000 100000 50000; do
-  echo $p | sudo tee /sys/sync_pmu/period
-  echo 1 | sudo tee /sys/sync_pmu/status
-  sleep 5
-  echo 0 | sudo tee /sys/sync_pmu/status
-  cat /sys/sync_pmu/missed
-  grep NMI /proc/interrupts
-done
-sudo dmesg | grep -iE 'oops|deadlock|warn' || echo "clean"
-sudo rmmod pmu_sync_sample
-```
-
-All four periods passed: `missed=0` throughout, NMI counter incremented in
-`/proc/interrupts`, no oops/warn/bug, `Interrupts taken` non-zero at exit.
-
-**Single-CPU production target.** The intended workload is
-`taskset -c PMU_TARGET_CPU ./prog`, not all-CPU sampling, so the module
-now arms counters only on `PMU_TARGET_CPU` (defined in
-[`module/pmu_api.h`](module/pmu_api.h), default 3) — `startCtrs`,
-`stopCtrsLocal`, and `dumpCtrs` are dispatched via
-`smp_call_function_single(PMU_TARGET_CPU, ...)`, and the NMI handler in
-[`module/intel.c`](module/intel.c) returns `NMI_DONE` on every other CPU
-so unrelated NMIs (watchdog/kgdb) still propagate. Single-CPU sampling
-at the paper's period=50,000 is verified clean even with concurrent
-`dd` reads (see "Single-CPU verification on CPU 3" above). The all-CPU
-dd-induced lockup is out of scope for this user's workflow.
-
-### Out of scope for this subtask
-The second README issue (`stopAll()` clobbers global PMU state on every CPU
-at `rmmod`) — doesn't cause hangs, just steals counters from other PMU
-users. Defer.
-
-## Stage 4 — Subtask 3: expand to 8 GP + 3 fixed counters
-
-Goal: sample all 11 counters per PMI (was 4 GP + 1 fixed).
-
-Risk: medium. Bigger code surface, but Subtask 0 is now in place so a
-runaway NMI can no longer wedge the kernel.
-
-Critical files:
-- [module/sample_buffer.h:10-14](module/sample_buffer.h#L10-L14) — grow
-  `struct sample` to `gp[8] + fixed[3]`.
-- [module/intel.c:18](module/intel.c#L18),
-  [module/intel.c:117-125](module/intel.c#L117-L125),
-  [module/intel.c:73-75](module/intel.c#L73-L75) — bump `num_ctrs`, MSR masks,
-  per-counter loops; add `read_fixed()`.
-- [module/pmu_sync_sample_main.c:178-200,229-231,306-314](module/pmu_sync_sample_main.c#L178-L200)
-  — extend sysfs attrs `0..7`, update `gatherSample()` reads, update
-  `myattr_attrs[]`.
-- [textreader.cpp:71-82](textreader.cpp#L71-L82) — print all 11 counters
-  per row.
-
-**VM-only defense:** if `dmesg` in Phase B reported fewer than 8 GP counters,
-`wrmsrl(MSR_CORE_PERF_GLOBAL_CTRL, 0xFF | (7ULL<<32))` will #GP on the
-nonexistent counters. Read the available count from `CPUID 0xA EAX[15:8]`
-and write only the available mask. Treat this as VM-specific defensiveness —
-don't ship it to bare metal where all 8 are present.
-
-Verify in guest, escalating period as in Stage 3:
-
-```bash
-sudo insmod module/pmu_sync_sample.ko
-for i in 0 1 2 3 4 5 6 7; do echo $((0xC0)) | sudo tee /sys/sync_pmu/$i; done
-echo 10000000 | sudo tee /sys/sync_pmu/period
-echo 1 | sudo tee /sys/sync_pmu/status
-sleep 2
-sudo ./textreader </dev/pmu_samples | head -5
-echo 0 | sudo tee /sys/sync_pmu/status
-sudo rmmod pmu_sync_sample
-```
-
-Commit + push, refresh snapshot to `post-subtask3`.
-
-## Stage 5 — Subtask 4: paper-style verification at period=50,000
-
-| Idx | Event:Umask | Meaning |
-|---|---|---|
-| 0 | `0xC0:0x00` | INST_RETIRED.ANY (cross-check vs FIXED0) |
-| 1 | `0x3C:0x00` | CPU_CLK_UNHALTED.CORE (cross-check vs FIXED1) |
-| 2 | `0x3C:0x01` | CPU_CLK_UNHALTED.REF (cross-check vs FIXED2) |
-| 3 | `0xC4:0x00` | BR_INST_RETIRED.ALL |
-| 4 | `0xC5:0x00` | BR_MISP_RETIRED.ALL |
-| 5 | `0x2E:0x4F` | LONGEST_LAT_CACHE.REFERENCE |
-| 6 | `0x2E:0x41` | LONGEST_LAT_CACHE.MISS |
-| 7 | `0xC0:0x01` | INST_RETIRED.PREC_DIST |
-
-These are architectural events with stable encodings across Intel
-generations, so the table works on Skylake-SP, Ice Lake, and Alder Lake
-P-core alike.
-
-```bash
-sudo insmod module/pmu_sync_sample.ko
-# write each (umask<<8)|event into /sys/sync_pmu/0..7
 echo 50000 | sudo tee /sys/sync_pmu/period
+
 echo 1 | sudo tee /sys/sync_pmu/status
-./exercise1 &                          # supply real load
-sudo ./textreader </dev/pmu_samples > /tmp/samples.csv &
-sleep 5
+~/pmu_sync_sampler/microbench 6 &              # CPU 3 workload
+taskset -c 0 sudo dd if=/dev/pmu_samples \
+    of=/tmp/samples.bin bs=4096 iflag=fullblock count=20 status=none
+wait
 echo 0 | sudo tee /sys/sync_pmu/status
-kill %1; wait
+
+cat /sys/sync_pmu/missed
+grep NMI /proc/interrupts                      # only CPU 3 should grow
 sudo rmmod pmu_sync_sample
 ```
 
-Verification queries on `/tmp/samples.csv` (small awk/python helper):
-- `fixed1` ≈ 50000 per sample (drift only from interrupt latency).
-- `gp[0] ≈ fixed[0]` (INST_RETIRED.ANY vs FIXED0).
-- `gp[1] ≈ fixed[1]` (CPU_CLK_UNHALTED.CORE vs FIXED1).
-- `gp[2] ≈ fixed[2]` (CPU_CLK_UNHALTED.REF vs FIXED2).
-- Branch misprediction rate `gp[4]/gp[3]` plausible (single-digit %).
-- `cat /sys/sync_pmu/missed` low and not exploding.
+Decode `samples.bin` with the same script used in the Subtask 0
+verification (16-byte buffer header: `int core; int num_samples; ptr`;
+then `num_samples × 40-byte sample = ulong cycles + ulong pid + uint
+counters[6]`). Subtask 3 will widen this to 60 bytes per sample.
 
-All five within ~2% tolerance → Stage 5 passes. Commit + push, final
-snapshot `post-subtask4`.
+### Single-CPU verification results (Subtask 0)
+
+| Test | Period | Workload | NMIs on CPU 3 | Captured | `missed` | dd reads |
+|---|---|---|---|---|---|---|
+| A | 100,000 | microbench, no dd | 100,712 | 816 = 8 buf × 102 | 99,896 | n/a |
+| B | 100,000 | microbench + dd 10 buf | 120,383 | 1,836 | 118,547 | OK (40 KB) |
+| C | 50,000 (paper) | microbench + dd 20 buf | 174,171 | 2,856 | 171,315 | OK (80 KB) |
+
+In Test A the captured count exactly matches `8 × BUFFER_ENTRIES` —
+without a reader, `empty_buffers` drains, every subsequent NMI bumps
+`missed`. Correct behavior.
+
+Decoded Test C samples: `core=3`, `num_samples=102`,
+`pid` = microbench, `cycles ≈ 51,000 ≈ period`, four GP counters all
+showing matching INST_RETIRED.ANY values.
+
+### Snapshots in libvirt
+
+- `clean-build` — toolchain installed, repo built, no insmod yet.
+- `post-subtask2` — Subtask 2 verified.
 
 ---
 
@@ -483,111 +367,53 @@ snapshot `post-subtask4`.
 | Symptom | Action |
 |---|---|
 | Guest unresponsive, SSH dead | `virsh destroy pmu-test` from host |
-| Suspect kernel oops, guest still alive | `journalctl -k -b > /tmp/oops.log && scp ...` before destroy |
+| Suspect kernel oops captured | `virsh console pmu-test` to read serial dmesg, scp out, then destroy |
 | Need to retry from scratch | `virsh snapshot-revert pmu-test <snap>` |
-| Module load failed cleanly (no hang) | `dmesg \| tail -50`, fix, `make`, re-insmod — no VM reset |
+| Module load failed cleanly (no hang) | `dmesg \| tail -50`, fix, `make`, re-insmod — no VM reset needed |
 
-Persist `/var/log/kern.log` and `dmesg` after every test run via `scp` so a
-guest revert doesn't lose them.
+Persist `dmesg` after every test run via `scp` so a guest revert
+doesn't lose them.
 
-## When to leave the VM
+## Out of scope (deferred or won't-fix here)
 
-After Stage 5 passes inside the VM, Subtask 0 has demonstrably closed the
-deadlock and the module is ready for cautious bare-metal use:
-
-1. Reboot the host (clean PMU state).
-2. Load the module. **Do not** enable sampling immediately.
-3. Repeat Stages 1 → 5 on bare metal with the same period escalation. Use a
-   serial console or netconsole so an oops can be captured.
-4. Only then run real workloads.
-
-The remaining "`stopAll()` clobbers global PMU state" issue
-([README.md](README.md) known issue #2) is still present — be explicit that
-this module shouldn't coexist with `perf record` or other PMU users on the
-host until that's fixed too.
+- **All-CPU sampling.** Production target is single-CPU; the all-CPU dd
+  deadlock isn't blocking and isn't pursued.
+- **`stopAll()` clobbers global PMU state on every CPU at `rmmod`.**
+  Doesn't cause hangs; just steals counters from other PMU users.
+  Should be scoped to only counters we own, but later.
+- **`sender/`, `reader/` wire format still encodes 6 counters.** Will
+  silently truncate after Subtask 3 widens `struct sample`. Fix
+  alongside Subtask 4 if needed; for now `textreader.cpp` is the
+  reference reader.
 
 ---
 
-## Critical files (single reference list)
+## Appendix: testing on Ubuntu 24.04 / kernel 6.x / Alder Lake
 
-- [module/pmu_sync_sample_main.c](module/pmu_sync_sample_main.c) — char dev,
-  sysfs, buffer pipeline. Touched by Subtasks 0/2/3.
-- [module/intel.c](module/intel.c) — NMI handler, MSRs. Touched by Subtask 3.
-- [module/sample_buffer.h](module/sample_buffer.h) — kernel↔userspace ABI.
-  Bumped by Subtask 3.
-- [module/pmu_api.h](module/pmu_api.h) — minor: `read_fixed` decl in
-  Subtask 3.
-- [textreader.cpp](textreader.cpp) — print all 11 counters in Subtask 3.
-- [example_run.sh](example_run.sh) — drop `mknod` line in Subtask 2.
+Viable interim if `bastion` is unavailable, with caveats.
 
-## Out of scope
-
-- `sender/`, `reader/` — wire format still encodes 6 counters; documented
-  limitation, not blocking the subtasks.
-- `stopAll()` global-PMU clobber — not a deadlock, defer.
-- Bare-metal validation — covered in "When to leave the VM" but not part of
-  this VM-only document.
-
----
-
-## Addendum — Testing on Ubuntu 24.04 / kernel 6.x / Alder Lake host
-
-This is a viable interim if the original Skylake-SP / 5.15 host
-(`bastion`) is unavailable. Three host differences to handle.
-
-### A1. Hybrid PMU (P-cores + E-cores)
-
-Alder Lake is hybrid: P-cores expose 8 GP + 3 fixed counters; E-cores expose
-6 GP + 3 fixed and use a different event encoding. The module's
-`on_each_cpu(startCtrs, ...)` writes
-`MSR_CORE_PERF_GLOBAL_CTRL = 0xFF | (7ULL<<32)` to *every* logical CPU — on
-E-cores that hits nonexistent counters and may #GP.
-
-**Workaround for VM testing: pin all vCPUs to P-cores only.** The guest
-then sees a homogeneous PMU.
+**Hybrid PMU.** P-cores expose 8 GP + 3 fixed counters; E-cores expose
+6 GP + 3 fixed and use a different event encoding. Pin all vCPUs to
+P-cores so the guest sees a homogeneous PMU:
 
 ```bash
-# On the host, identify P-cores (kernel 6.x exposes type via cpu_core/cpu_atom)
-cat /sys/devices/cpu_core/cpus         # P-core CPU list
-cat /sys/devices/cpu_atom/cpus         # E-core CPU list
-# fallback:
-lscpu --extended                       # P-cores typically have higher MAX_MHZ
+cat /sys/devices/cpu_core/cpus     # P-core CPUs (kernel 6.x)
+cat /sys/devices/cpu_atom/cpus     # E-core CPUs
 
-# Pin vCPUs to P-core CPU IDs (example: P-cores are 0,2,4,6 with SMT siblings
-# at 1,3,5,7 — pick one thread per P-core for a single-threaded-per-core view)
 virsh -c qemu:///system vcpupin pmu-test 0 0
 virsh -c qemu:///system vcpupin pmu-test 1 2
 virsh -c qemu:///system vcpupin pmu-test 2 4
 virsh -c qemu:///system vcpupin pmu-test 3 6
-virsh -c qemu:///system vcpuinfo pmu-test     # confirm
 ```
 
-If you're nervous about hot vcpu-pin, set it in the domain XML before first
-boot via `virsh edit pmu-test` (`<cputune><vcpupin vcpu="0" cpuset="0"/>...`).
+**Kernel 6.x API drift.** Watch for `class_create()` losing the
+`THIS_MODULE` argument in 6.4 — the Subtask 2 code uses the 5.15
+signature `class_create(THIS_MODULE, "pmu_samples")` which won't compile
+on 6.4+. Use `class_create("pmu_samples")` instead.
 
-### A2. Kernel 6.x API drift since 5.15
+**Event encodings** are architectural — the Subtask 4 table works on
+Alder Lake P-core unchanged. Just record which CPU each Stage 5 run
+was on; steady-state numbers will differ between Skylake-SP and Alder
+Lake.
 
-Subtask 1 was verified on 5.15. Two known breakages on 6.x to watch for:
-
-- **`class_create()` lost the `THIS_MODULE` argument in 6.4.** The
-  Subtask 2 sketch above uses `class_create(THIS_MODULE, "pmu_samples")`
-  which won't compile on 6.4+. Use `class_create("pmu_samples")` instead.
-- **`kobj_type.default_attrs` was removed in 6.2.** Subtask 1 already
-  migrated to `default_groups`/`ATTRIBUTE_GROUPS()`, so this should be clean
-  — but rebuild and read the warnings.
-
-Run `cd module && make` first. Don't speculate about other API changes —
-let the compiler tell you.
-
-### A3. Event encodings
-
-The Subtask 4 events are all *architectural* (encodings stable across Intel
-generations per SDM Vol 3B Ch 19), so the table works on Alder Lake P-core
-without modification. But when `bastion` finally comes back, the steady-state
-numbers from Stage 5 will differ between Alder Lake and Skylake-SP — they're
-different microarchitectures. Record which CPU each Stage 5 run was on.
-
-### A4. Plan adjustments
-
-In Phase B's cloud-init flow, set `DIST=noble` for Ubuntu 24.04 and use
-`--os-variant ubuntu24.04`. Everything else is unchanged.
+In the cloud-init flow, set `DIST=noble` and `--os-variant ubuntu24.04`.

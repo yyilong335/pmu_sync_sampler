@@ -5,3 +5,8 @@ hello
 sender/sender
 textreader
 #<AutoIgnore/>
+
+# Local-only plan/scratch markdown — VM_TESTING.md is the tracked source of truth.
+plans/
+microbench
+samples.bin
