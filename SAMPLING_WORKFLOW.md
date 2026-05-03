@@ -1,8 +1,8 @@
 # Sampling workflow — what happens around each PMI
 
-Companion to [VM_TESTING.md](VM_TESTING.md). This doc answers "where
-does the kernel module run, when do counters tick, and what do
-`cyc` / `CPU_CLK_CORE` / `REF_TSC` actually measure" — and
+Companion to [VM_TESTING.md](VM_TESTING.md). This doc answers
+"where does the kernel module run, when do counters tick, and
+what do `cyc` / `CPU_CLK_CORE` / `REF_TSC` actually measure" — and
 identifies the small piece of overcounting baked into the design.
 
 ## Where things run
@@ -10,10 +10,9 @@ identifies the small piece of overcounting baked into the design.
 - **Workload**: `taskset -c 3 ./microbench_mem` runs entirely on
   CPU 3 in user mode (Ring 3).
 - **Kernel module**: only programs PMU MSRs on CPU 3
-  (`smp_call_function_single(PMU_TARGET_CPU, …)` for arm/disarm),
-  and registers a *single* per-CPU NMI handler. The NMI handler
-  returns `NMI_DONE` immediately on any other CPU, so only CPU 3
-  ever does PMU work.
+  (`smp_call_function_single(PMU_TARGET_CPU, …)` for arm/disarm).
+  We register a single per-CPU NMI handler that returns
+  `NMI_DONE` immediately on every other CPU.
 - **NMI handler**: runs on whichever CPU got the PMI. We program
   `FIXED_CTR1` only on CPU 3, so only CPU 3's `LVTPC` ever fires
   the PMI, so the NMI handler always runs on CPU 3.
@@ -21,173 +20,175 @@ identifies the small piece of overcounting baked into the design.
 So: workload, sampler, and NMI all share CPU 3. The PMU only
 counts CPU 3 events. There is no cross-core leakage.
 
-## What the counters are configured to count
+## Does the handler add to the PMU counters? Yes, a small amount
 
-Slot configuration ([events.conf](events.conf)) writes
-`USR=1, OS=1, EN=1` (forced by [pmn_config](module/intel.c)). So
-every GP counter counts events that occur in **both user mode and
-kernel mode** while CPU 3 is unhalted. The fixed counters are
-similarly OS+USR (`FIXED_CTR_CTRL = 0x3B3`).
+GP slots are programmed with `USR=1, OS=1, EN=1` (forced by
+[`pmn_config`](module/intel.c)), so every event the handler causes
+is counted alongside the workload. Concretely:
 
-Two consequences:
+- INST, LOAD, STORE, BRANCH: in the VM the handler executes
+  ~30 instructions per period (mostly `rdmsrl` + bookkeeping);
+  on bare metal ~10. Out of ~12,000 instructions per period this
+  is < 0.3 % — ignorable.
+- STALL_ISSUE / STALL_RETIRE: the handler is *mostly* stall
+  cycles waiting on `rdmsrl` to return. In the VM it adds ~12K
+  stall cycles to the ~54K we see per sample — visible but
+  bounded. On bare metal it adds ~500.
+- L1D_REPLACEMENT / L1I_MISS: handler code touches a few
+  cache lines but it's the same lines every PMI, so they're
+  hot in L1 after the first few samples. Negligible
+  contribution.
 
-1. While the workload runs, every retired load/store/branch the
-   workload performs is counted ✓.
-2. **While the NMI handler runs, every load/store/branch the
-   handler performs is *also* counted.** The handler is just code
-   running on CPU 3 — the PMU doesn't know whose code it is.
+The workload is **paused** while the handler runs (NMI is
+non-reentrant on x86). They are interleaved in time, never
+concurrent. But the *counters keep ticking* through the handler —
+that's the entire source of overcounting.
 
 ## Sequencing of one PMI
 
 ```
    ─── handler N exits ───┐                                   ┌─── handler N+1 starts
                           ▼                                   ▼
-        … ┐ wrmsrl ┐ wrmsrl ┐ apic_write ┐ IRET ╞═══════════════════════════════╡ vmexit ┐ kvm ┐ vmenter ┐ NMI gate ┐ do_nmi ┐ my_nmi_handler ┐ wrmsrl ┐ gatherSample ┐ ...
-          │ reset  │ reset  │            │      │ ←── ~50,000 unhalted core ──→ │
-          │ FIXED1 │ FIXED2 │            │      │       cycles of period         │
-          │        │ to 0   │            │      │       (workload running)       │
-          │   counter values from here on are accumulated for sample N+1
+        … ┐ wrmsrl reset ┐ apic_write LVTPC ┐ IRET ╞═══════════════════════════════╡ vmexit ┐ kvm ┐ vmenter ┐ NMI gate ┐ do_nmi ┐ my_nmi_handler ┐ gatherSample ┐ ...
+                                            │      │ ←── 50,000 unhalted core ──→ │
+                                            │      │       cycles of period       │
+                                            │      │       (workload running)     │
+                                            │   counter values from here on are accumulated for sample N+1
                                                   ▲
                                                   └─ FIXED_CTR1 overflows here
                                                      → physical PMI raised
 ```
 
-Counters tick continuously the whole time except during the
-narrow window between the resets and the next overflow. Concretely:
+By hardware construction, the time from "FIXED_CTR1 reset" in
+handler N to "FIXED_CTR1 overflow" is *exactly* `period = 50,000`
+unhalted core cycles. The interrupt fires at the moment of
+overflow. After that, the handler runs with some entry latency
+before any counter is read.
 
-- `FIXED_CTR1` (cycles) is reset to `(0xFFFFFFFFFFFF − period)` at
-  the end of handler N. From there it counts every unhalted core
-  cycle until it overflows at exactly `0` — that's the next PMI.
-  By construction, the elapsed unhalted core cycles between
-  successive PMIs is *exactly* `period = 50,000`.
-- `FIXED_CTR0` (instructions), `FIXED_CTR2` (REF_TSC), and
-  `PERFCTR0..7` (GP) are all reset to `0` at the end of handler N.
-  They start counting from 0 *before* the next period begins (i.e.
-  during handler N's tail) and continue counting throughout
-  the period and into handler N+1, until each one is read.
+## What `cyc`, `CPU_CLK_CORE`, and `REF_TSC` actually measure
 
-## Does the handler add to the counters? Yes, a small amount
+These three fields are **different MSRs read at different times**.
+They are *not* equal — not in the VM, not on bare metal:
 
-While handler N+1 is running, all enabled counters are still
-counting. Anything the handler does (MSR reads, register pushes,
-branches, etc.) gets folded into sample N+1's counter values.
+| Field | Hardware source | Reset point | Read point | What its value means |
+|---|---|---|---|---|
+| `cyc` (= `read_ccnt() + period`) | FIXED_CTR1 | `(overflow − period)` at end of handler N | **first** counter read in handler N+1 | period + handler entry latency |
+| `CPU_CLK_CORE` (= `s->fixed[1]`) | FIXED_CTR1 (same MSR!) | same reset | **after** 8 GP `rdmsrl`s | "raw FIXED_CTR1" = handler entry latency + GP-read time |
+| `REF_TSC` (= `s->fixed[2]`) | FIXED_CTR2 | `0` at end of handler N | **last** read in handler N+1 | handler-N tail + period + entire handler-N+1 prologue + 11 `rdmsrl`s |
 
-Concretely, sample N+1's `LOAD` count includes:
-- ≈ 50,000 cycles of workload execution: ~thousands of loads
-- handler N's tail (a few wrmsrls + apic_write): a handful of loads
-- handler N+1's prologue + the `rdmsrl`s before LOAD is read:
-  ~10–20 loads in kernel context
+So if `cyc ≈ 62,000`, `CPU_CLK_CORE ≈ 17,000`, `REF_TSC ≈ 68,000` —
+they're all consistent: `cyc - period = 12,031` is the FIXED_CTR1
+raw value at the *first* read, `CPU_CLK_CORE = 17,122` is the
+*same MSR* re-read after 8 GP reads (so it's larger by the GP-read
+time), and `REF_TSC` includes the entire period plus everything
+the handler did up to the very last MSR read.
 
-In the VM, the handler is ~12,000 cycles long but executes only
-~30 instructions (most of those cycles are the CPU stalled waiting
-on `rdmsrl`/VMEXITs). So handler-attributable instruction events
-are `O(30)` out of ~12,000 retired in a 50,000-cycle period —
-under 0.3 %. On bare metal the handler is ~500 cycles total,
-~10–15 instructions, ~0.1 % of the period — also negligible.
+## And `cyc` is *not* 50,000 when the interrupt fires
 
-The exception is `STALL_ISSUE` / `STALL_RETIRE`: the handler's
-many `rdmsrl`s are themselves stall cycles. Of the ~13K cycles
-the handler spends in the period window (period + entry latency),
-nearly all of those are stalls, contributing ~13K to the stall
-count of every sample. That's why we see `STALL_ISSUE/cyc ≈ 0.85`
-even for a chase loop that's already ~95 % stall-bound — the
-handler's own stalls dominate the remainder.
+The interrupt fires at the moment FIXED_CTR1 overflows; at that
+exact instant raw FIXED_CTR1 = 0 and `cyc` doesn't exist (we
+haven't run any code yet). `cyc` is computed *inside* the handler
+after some entry latency:
 
-We don't subtract this out. It would require either a control-only
-sampling pass or per-CPU instrumentation of the handler itself —
-either way significantly more code, and the overcounting is
-small enough on bare metal to ignore.
+```
+cyc = read_ccnt() + period
+    = handler-entry-latency-in-cycles + period
+    ≈ 13,000 + 50,000  (in VM)
+    ≈ 63,000
+```
 
-## Is the workload running while the NMI handler runs?
+The "rule" is "fire the interrupt every 50,000 unhalted core
+cycles," which is the period programmed into FIXED_CTR1's reset
+offset. Everything we *read in software* comes after that, so
+every cycle field is ≥ 50,000.
 
-**No.** The CPU executes one stream at a time. When the PMI
-arrives, the CPU saves the current context, jumps to the NMI gate,
-and runs the handler. The workload is paused during this time. NMI
-is non-reentrant on x86 — once one is being serviced, the CPU
-masks further NMIs until `IRET` is executed.
+## Where the variance of REF_TSC comes from
 
-So there is no concurrent workload-vs-handler running. There IS,
-however, the fact that the counters keep ticking through the
-handler — that's the overcounting source.
+`REF_TSC = handler-N tail + period + handler-N+1 entry path up to
+read_fixed(2)`. The period contributes **zero** variance (by
+hardware construction). Everything else does:
 
-## `cyc` vs `CPU_CLK_CORE` vs `REF_TSC`
+| Source | Magnitude (VM) | Variance contribution |
+|---|---|---|
+| Handler N tail (after FIXED_CTR2 reset) | ~few hundred cycles | ~50 |
+| **VMEXIT → KVM PMI inject → VMENTER on PMI delivery** | ~6,000–9,000 | **~500–700 (dominant)** |
+| NMI gate prologue + Linux `do_nmi` dispatch | ~700 | ~50 |
+| Our handler prologue (incl. any in-handler `wrmsrl`) | ~500–2,000 | ~100–300 |
+| 8 `read_pmn` + `read_fixed(0/1)` ahead of `read_fixed(2)` | ~5,000 | ~100–200 |
 
-All three measure cycles, but at different read points:
+**The VMEXIT/VMENTER path is the dominant source.** It's
+hypervisor code we cannot influence from the guest. That ~500-cycle
+stdev is the floor.
 
-| Field | What it is | Where we read it | Driven by |
+### What we changed to reduce the variance / mean
+
+There was a `wrmsrl(MSR_CORE_PERF_GLOBAL_OVF_CTRL, ...)` *before*
+`gatherSample()` that cleared the overflow flags. Per Intel's
+PMI flow, the flag clear only needs to happen before LVTPC is
+re-armed, not before reading counters. Moving it past the reads
+removes one variable-cost wrmsrl from the path leading to
+`read_fixed(2)`. Measured impact (5 runs, 21,751 samples each,
+period=50,000):
+
+| Field | Before (wrmsrl before reads) | After (wrmsrl after reads) | Δ |
 |---|---|---|---|
-| `s->cycles` (`cyc`) | Computed: `read_ccnt() + period` | First counter read in the handler | FIXED_CTR1 |
-| `s->fixed[1]` (`CPU_CLK_CORE`) | Same MSR (FIXED_CTR1) read again, later | After GP reads (in current code) | FIXED_CTR1 |
-| `s->fixed[2]` (`REF_TSC`) | TSC ticks since last reset | Read in `read_fixed(2)` | FIXED_CTR2 |
+| `cyc` mean | 63,081 | 62,031 | **−1,050** |
+| `cyc` stdev | 667 | 685 | ≈0 |
+| `CPU_CLK_CORE` mean | 18,219 | 17,122 | **−1,097** |
+| `CPU_CLK_CORE` stdev | 693 | 710 | ≈0 |
+| `REF_TSC` mean | 69,286 | 68,024 | **−1,262** |
+| `REF_TSC` stdev | 777 | 785 | ≈0 |
 
-**`cyc`** is anchored to the overflow itself. `read_ccnt()` returns
-"core cycles since `FIXED_CTR1` overflowed" — i.e. handler entry
-latency expressed in cycles. We add `period` so the field reads
-"approximate elapsed cycles between successive PMIs." It always
-satisfies `cyc ≥ period` by construction.
+The means dropped by ~1.2 K cycles (the `wrmsrl(OVF_CTRL)` cost
+itself), bringing every cycle field a little closer to `period`.
+**Variance is unchanged**, confirming our model: in the VM, the
+variance floor is KVM's PMI delivery jitter, not the handler's
+internal ordering.
 
-**`CPU_CLK_CORE`** is the SAME hardware counter as `cyc`, just
-read a few hundred cycles later in the handler. It's always
-≥ `cyc - period`, and it's always a *bit* larger than `cyc - period`
-because of the extra MSR reads between the two reads.
-
-**`REF_TSC`** is a different counter — it ticks at TSC rate (= core
-base frequency on Skylake, regardless of P-state). With turbo off,
-core rate = TSC rate, so on bare metal `REF_TSC ≈ FIXED_CTR1` (in
-unhalted cycles). In a KVM guest, however, **TSC ticks during the
-VMEXIT/VMENTER round-trip even though `FIXED_CTR1` does not** —
-the guest's CORE counter is paused while the hypervisor is
-running, but the guest's TSC counter is just `host_TSC + offset`,
-so it advances continuously. That's why we see
-`REF_TSC > CPU_CLK_CORE > cyc` in the VM, with the gap
-`REF_TSC - cyc` being the wall-clock VMEXIT/VMENTER cost in TSC
-ticks.
-
-On bare metal: no VMEXIT, so `REF_TSC ≈ cyc ≈ period + small
-handler latency`. With period=50,000 and a ~500-cycle handler,
-expect all three fields to report ~50,500 — to within tens of
-cycles.
-
-## Why does REF_TSC vary per-sample (range ~9,000 in the VM)?
-
-In the VM, the dominant source is **KVM PMI-delivery jitter**: each
-PMI is delivered via VMEXIT → KVM injection → VMENTER, and that
-round-trip takes a variable number of host cycles depending on
-host scheduling, TLB/cache state, what other vCPUs are doing, etc.
-Per-PMI variance of ~500–1,000 cycles is normal and bounded only
-by the hypervisor's behavior — there's nothing the guest module
-can do about it.
-
-We tried reordering `gatherSample` to read the fixed counters
-*before* the GP counters (theory: REF_TSC read 8 MSR-loads earlier
-→ less accumulated jitter). Measured outcome:
-
-| Read order | REF_TSC per-sample stdev | mean | range |
-|---|---|---|---|
-| Original (REF read 11th in handler) | 777 | 69,286 | 9,152 |
-| Reordered (REF read 3rd in handler) | 769 | 64,569 | 8,840 |
-
-Per-sample variance is essentially the same (within sample-size
-noise) — the VMEXIT jitter dominates regardless of where in the
-handler we read. The reorder *does* lower the mean by ~5 K
-(closer to `period`), but the user's primary ask is stability,
-not absolute offset. We **kept the original order** to stay as
-close to the upstream gatherSample as possible. On bare metal:
-no VMEXIT, no KVM injection — REF_TSC variance drops to tens of
-cycles regardless of read order, and mean lands at
-`period + handler-entry-cycles ≈ 50,200`.
+We tried earlier reordering `gatherSample` to read fixed counters
+before GP counters (read REF_TSC 8 MSRs earlier). Same result:
+mean shifts but variance is unchanged. We left the read order
+matching the original gatherSample shape — it's not the lever
+that controls variance.
 
 ### What stable looks like, by counter
 
-| Field | Cross-run mean (VM) | Per-sample stdev (VM) | Bare-metal projection |
+| Field | VM mean | VM stdev | Bare-metal projection (turbo off, prep script applied) |
 |---|---|---|---|
-| `cyc` (`read_ccnt()` + period) | ~63,000 | ~700 | ~50,200 ± 50 |
-| `CPU_CLK_CORE` (FIXED1 read late) | ~18,100 | ~700 | ~600 (period-only delta) |
-| `REF_TSC` (FIXED2 read last) | ~69,200 | ~770 | ~50,200 ± 50 |
+| `cyc` | ~62,000 | ~700 | ~50,200 ± 50 |
+| `CPU_CLK_CORE` (FIXED1 read late) | ~17,100 | ~700 | ~600 (period-only delta from FIXED1 reset) |
+| `REF_TSC` (FIXED2 read last) | ~68,000 | ~800 | ~50,200 ± 50 |
 
 For "is the sampler firing every 50,000 cycles?" the cleanest
-answer is `cyc - period` (the *raw* `read_ccnt()` value): it's
-the cycles between FIXED1 overflow and the very first counter
-read of the handler, with the smallest possible MSR-read pile-up
-in front of it. In the VM that's stably ~13,000 (= the KVM PMI
-delivery cost). On bare metal that becomes ~200–500.
+answer is `cyc - period` — the *raw* `read_ccnt()` value, which is
+the cycles between FIXED_CTR1 overflow and the very first counter
+read of the handler. In the VM that's stably ~12,000 (= the KVM
+PMI delivery cost). On bare metal it becomes ~200–500.
+
+### Why the variance can't be reduced further inside the module
+
+The smallest variance you could achieve, even with the most
+aggressive in-handler reordering, would be the per-sample VMEXIT
+jitter alone — about ±500 cycles in the VM. That's already what
+we observe. Anything further would require either:
+
+- the host hypervisor to respond to PMI more deterministically
+  (out of scope; KVM's PMI path is what it is), or
+- skipping the VM entirely.
+
+On bare metal there is no VMEXIT and the entire variance budget
+is the hardware NMI gate (~50 cycles) plus a few `rdmsrl` (a few
+cycles each). Expected REF_TSC stdev: tens of cycles, with mean
+within ~500 of the period.
+
+## Summary for the bare-metal migration
+
+- The kernel module's behavior on CPU 3 is the same with or
+  without a hypervisor — same MSR programming, same NMI handler.
+- Per-sample sanity checks all hold (STALL ≤ cyc, LOAD+STORE+
+  BRANCH ≤ INST, GP7 = 0, etc.) — see VM_TESTING for the audit.
+- Mean values for cycle-tied counters in VM are inflated by the
+  ~12 K cycle KVM PMI overhead. On bare metal, expect them to
+  collapse to ~50,200 ± small.
+- Per-sample variance in VM is ~700 cycles for cycle counters,
+  dominated by VMEXIT timing. Bare metal: ~50.

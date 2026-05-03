@@ -81,9 +81,6 @@ static int my_nmi_handler(unsigned int cmd, struct pt_regs *regs)
 
     total_interrupts += 1;
 
-    wrmsrl(MSR_CORE_PERF_GLOBAL_OVF_CTRL,
-            (1ULL << 63) | (1ULL << 62) | (7ULL << 32) | 0xFFULL);
-
     gatherSample();
 
     /* Reset all 8 GP counters and FIXED_CTR0 / FIXED_CTR2 so the next
@@ -95,6 +92,14 @@ static int my_nmi_handler(unsigned int cmd, struct pt_regs *regs)
     }
     wrmsrl(MSR_ARCH_PERFMON_FIXED_CTR0, 0);
     wrmsrl(MSR_ARCH_PERFMON_FIXED_CTR0 + 2, 0);
+
+    /* Clear the overflow flags only after the reads -- it's only
+     * required before re-arming LVTPC, and keeping it out of the
+     * gatherSample path removes one variable-cost wrmsrl from the
+     * read-side latency (matters in KVM where each MSR write costs
+     * ~500-2000 cycles with jitter). */
+    wrmsrl(MSR_CORE_PERF_GLOBAL_OVF_CTRL,
+            (1ULL << 63) | (1ULL << 62) | (7ULL << 32) | 0xFFULL);
 
     if (shutdown != 0) {
         wrmsrl(MSR_CORE_PERF_GLOBAL_CTRL, 0);
