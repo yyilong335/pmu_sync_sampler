@@ -85,6 +85,41 @@ and forces USR/OS/EN.
 Edit `events.conf` to change the set; [`start_sampler.sh`](start_sampler.sh)
 loads the module, sets `period`, writes each slot, and starts sampling.
 
+### First-sample contamination — found and fixed
+
+A thorough verification of run-1 sample-0 (and the first few samples
+generally) caught `STALL_ISSUE > cyc` and `STALL_RETIRE > cyc`, which
+is impossible if the counter starts at 0. Tracing the lifecycle:
+
+1. NMI handler N (last one before `status=0`) resets PERFCTR0..7,
+   FIXED_CTR0, FIXED_CTR2 to 0.
+2. **Counters keep ticking between handler N exit and `stopCtrs`** —
+   `GLOBAL_CTRL` is still on. By the time `stopCtrs` clears
+   `GLOBAL_CTRL`, the counters have accumulated some events.
+3. `stopCtrs` freezes them; `rmmod` doesn't touch MSRs.
+4. `insmod` + `startCtrs`: only `FIXED_CTR1` was rewritten (via
+   `write_ccnt`); PERFCTR0..7, FIXED_CTR0, FIXED_CTR2 retained
+   their frozen leftover values.
+5. First PMI's sample = leftover residue + new period's events,
+   producing nonsensical relations like STALL > cyc.
+
+**Fix:** `startCtrsLocal` now clears PERFCTR0..7, FIXED_CTR0, and
+FIXED_CTR2 immediately after writing FIXED_CTR1, before
+`GLOBAL_CTRL` is re-enabled — symmetric with the NMI handler's
+reset. ([module/intel.c:139-150](module/intel.c#L139-L150))
+
+After the fix, every per-sample sanity check across 21,754 samples
+(5 × 4,352 + dropped header rows) returns `0 / 21754`:
+
+| Check | Violations |
+|---|---|
+| `STALL_ISSUE > cyc` | 0 / 21,754 |
+| `STALL_RETIRE > cyc` | 0 / 21,754 |
+| `LOAD + STORE + BRANCH > INST_RETIRED` | 0 / 21,754 |
+| `fix1 < (cyc - period)` | 0 / 21,754 |
+| `REF_TSC < (cyc - period)` | 0 / 21,754 |
+| GP7 (unused slot) nonzero | 0 / 21,754 |
+
 ### Top-7 GP event verification (5 runs at period=50,000)
 
 Workload: [`microbench_mem`](microbench_mem.c) (16 MB pointer-chase,
@@ -94,43 +129,85 @@ simultaneously — same pattern as master's `example_run.sh` (no warmup
 sleep between arming and consuming). 64 buffers × 68 = 4,352 samples
 per run. All 5 runs landed identically with **zero missed**:
 
-| run | n | cyc | STALL_I | STALL_R | LOAD | STORE | BRANCH | L1D_R | L1I_M | INST | CYC_F |
-|---|---|---|---|---|---|---|---|---|---|---|---|
-| 1 | 4351 | 62,948 | 53,738 | 53,502 | 2,780 | 1,899 | 2,682 | 1,211 | 265 | 11,999 | 18,022 |
-| 2 | 4352 | 62,979 | 53,839 | 53,564 | 2,771 | 1,887 | 2,664 | 1,182 | 256 | 11,936 | 18,038 |
-| 3 | 4351 | 63,015 | 53,861 | 53,610 | 2,768 | 1,882 | 2,657 | 1,162 | 277 | 11,912 | 18,127 |
-| 4 | 4352 | 62,932 | 53,655 | 53,471 | 2,813 | 1,883 | 2,630 | 1,057 | 307 | 11,914 | 18,039 |
-| 5 | 4352 | 62,915 | 53,822 | 53,570 | 2,734 | 1,858 | 2,618 | 1,144 | 272 | 11,751 | 17,985 |
+| run | n | cyc | STALL_I | STALL_R | LOAD | STORE | BRANCH | L1D_R | L1I_M | INST | CYC_F | REF_TSC |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 1 | 4350 | 63,019 | 53,935 | 53,703 | 2,709 | 1,829 | 2,553 | 1,053 | 245 | 11,538 | 18,125 | 69,182 |
+| 2 | 4352 | 63,066 | 53,439 | 53,324 | 2,978 | 1,972 | 2,746 | 1,056 | 313 | 12,518 | 18,177 | 69,235 |
+| 3 | 4351 | 62,976 | 53,740 | 53,539 | 2,800 | 1,880 | 2,622 | 1,063 | 249 | 11,870 | 18,076 | 69,131 |
+| 4 | 4349 | 63,008 | 53,683 | 53,444 | 2,855 | 1,935 | 2,739 | 1,207 | 260 | 12,269 | 18,127 | 69,187 |
+| 5 | 4352 | 63,033 | 53,768 | 53,563 | 2,803 | 1,884 | 2,641 | 1,093 | 272 | 11,924 | 18,145 | 69,205 |
 
 Cross-run stability (5 runs):
 
 | Metric | Mean | Stdev | CV |
 |---|---|---|---|
-| `cyc` | 62,957.8 | 39.9 | **0.06%** |
-| STALL_ISSUE | 53,782.9 | 85.4 | 0.16% |
-| STALL_RETIRE | 53,543.5 | 56.0 | 0.10% |
-| LOAD | 2,773.2 | 28.1 | 1.01% |
-| STORE | 1,881.8 | 15.0 | 0.80% |
-| BRANCH | 2,650.2 | 25.9 | 0.98% |
-| L1D_REPLACEMENT | 1,151.3 | 58.3 | 5.06% |
-| L1I_MISS | 275.5 | 19.2 | 6.97% |
-| INST_RETIRED.ANY | 11,902.3 | 91.5 | 0.77% |
-| CPU_CLK_UNHALTED.CORE (post-handler) | 18,041.9 | 52.1 | 0.29% |
+| `cyc` | 63,020.5 | 33.1 | **0.05%** |
+| STALL_ISSUE | 53,713.0 | 179.4 | 0.33% |
+| STALL_RETIRE | 53,514.7 | 141.3 | 0.26% |
+| LOAD | 2,829.0 | 98.3 | 3.47% |
+| STORE | 1,900.1 | 55.0 | 2.90% |
+| BRANCH | 2,660.1 | 82.1 | 3.09% |
+| L1D_REPLACEMENT | 1,094.5 | 64.9 | 5.93% |
+| L1I_MISS | 268.1 | 27.4 | 10.23% |
+| INST_RETIRED.ANY | 12,023.7 | 378.7 | 3.15% |
+| CPU_CLK_UNHALTED.CORE (post-handler) | 18,130.2 | 36.7 | 0.20% |
+| **CPU_CLK_UNHALTED.REF_TSC** | **69,188.1** | **37.9** | **0.05%** |
 
-Cycle-driven counters (cyc, stalls, fixed-cycles) are **stable to
-within 0.3 %** across runs. Memory-event counts (LOAD, STORE, BRANCH,
-INST) come in at ≤ 1 % CV. Cache-miss events (L1D_REPLACEMENT,
-L1I_MISS) are noisier at 5–7 % — that's the inherent variance of
-cache-replacement under ASLR + slightly different scheduling each
-run, not sampler error.
+Cycle-driven counters (cyc, stalls, fixed-cycles, REF_TSC) are stable
+to within 0.33 %. Memory-event counts (LOAD/STORE/BRANCH/INST) come in
+at ~3 % CV — that's the natural workload-microvariation, not sampler
+noise. L1I_MISS is the noisiest at ~10 % (cache replacement is the
+most prefetcher-/scheduling-sensitive event); the absolute miss
+count is small (~270 per period).
 
-`cyc_mean = 62,958` is `period (50,000) + ~12,958 cycles VM PMI
+`cyc_mean = 63,020 = period (50,000) + ~13,020 cycles VM PMI
 overhead` — matches the constant overhead measured in the period
-sweep and confirms it's still the same KVM artifact, not noise.
+sweep, confirms it's still the same KVM artifact.
+
+### Why is REF_TSC ≈ 69,200 instead of 50,000?
+
+The user's expectation is `FIXED_CTR2 (REF_TSC) ≈ period`. In the VM
+that doesn't hold; on bare metal it should.
+
+`REF_TSC` measures elapsed TSC ticks during the per-period window —
+which on Skylake-SP is the wall-clock frequency. With turbo off,
+core rate = TSC rate, so 50,000 core cycles of unhalted execution =
+50,000 TSC ticks. The remainder above 50,000 is everything that runs
+*inside* the NMI handler from PMI delivery to the `read_fixed(2)`
+call: PMI-vector dispatch, NMI gate, our handler prologue, 8
+`rdmsrl` calls for the GP counters, etc.
+
+In the VM the additional cost is large because the NMI traverses a
+**VMEXIT → KVM PMI re-injection → VMENTER** path, plus `rdmsrl` is
+~10× slower under VMX. Concretely: `cyc - period ≈ 13,020`
+(unhalted CORE cycles spent inside the handler) and
+`REF_TSC - period ≈ 19,188` (TSC ticks during the same handler).
+Difference `REF_TSC - cyc ≈ 6,168` = the time the guest's CORE
+counter was paused in VMEXIT but TSC kept running.
+
+On bare metal, none of that exists: PMI delivery is a few hundred
+cycles, no VMEXIT, MSR reads are ~50 cycles each. Expected on
+bare-metal bastion at period=50,000, turbo disabled by
+`prepare_for_benchmarking.sh`:
+- `cyc ≈ 50,500–51,000` (period + ~few hundred cycles handler)
+- `REF_TSC ≈ cyc` (within tens of cycles)
+- so `REF_TSC ≈ 50,000` matching expectation.
 
 Stall fraction `STALL_ISSUE / cyc ≈ 0.85` — pointer-chase issues no
 uops in 85 % of cycles, as expected for an entirely memory-latency-
-bound loop. Subtask 4 done with the production event set.
+bound loop.
+
+### Per-sample CSV for review
+
+[`samples_review.csv`](samples_review.csv) (gitignored) is the full
+21,754-row dump from the 5-run verification. Columns:
+`run, sample_idx, pid, core, cyc, STALL_ISSUE, STALL_RETIRE, LOAD,
+STORE, BRANCH, L1D_REPLACEMENT, L1I_MISS, gp7_unused, INST_RETIRED,
+CPU_CLK_CORE, REF_TSC, cmdline, executable`. Use it to spot-check
+individual samples, look at distributions, or feed into your own
+analysis. [`samples_review_summary.txt`](samples_review_summary.txt)
+holds the per-run summary, cross-run stability table, sanity
+checks, and head/middle/tail spot-checks of run 1.
 
 ---
 

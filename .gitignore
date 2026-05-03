@@ -9,4 +9,7 @@ textreader
 # Local-only plan/scratch markdown — VM_TESTING.md is the tracked source of truth.
 plans/
 microbench
+microbench_mem
 samples.bin
+samples_review.csv
+samples_review_summary.txt

@@ -137,8 +137,15 @@ void startCtrsLocal(unsigned long* cfgs) {
     // Overflow once every 'period' cycles
     write_ccnt(0xFFFFFFFFFFFF - period);
     for (i=0; i<num_ctrs; i++) {
-	    pmn_config(i, cfgs[i]); 
+	    pmn_config(i, cfgs[i]);
+	    wrmsrl(MSR_ARCH_PERFMON_PERFCTR0 + i, 0);
     }
+    /* Symmetric with my_nmi_handler: clear FIXED_CTR0/2 so the very
+     * first sample after arming isn't contaminated with whatever the
+     * counters held when GLOBAL_CTRL was last cleared. (FIXED_CTR1 was
+     * just rewritten by write_ccnt above.) */
+    wrmsrl(MSR_ARCH_PERFMON_FIXED_CTR0, 0);
+    wrmsrl(MSR_ARCH_PERFMON_FIXED_CTR0 + 2, 0);
 
     /* FIXED_CTR_CTRL: FIXED0 OS|USR=0x3, FIXED1 OS|USR|PMI=0xB,
      * FIXED2 OS|USR=0x3 → 0x3 | (0xB<<4) | (0x3<<8) = 0x3B3 */
