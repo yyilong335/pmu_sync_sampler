@@ -23,8 +23,8 @@ subtask section for details.
 | 2 | udev-managed `/dev/pmu_samples` (drop hardcoded major 222) | ✓ done | [`7a59465`](../../commit/7a59465) |
 | — | x2APIC fix: `apic_write` for LVTPC programming *(pre-existing bug)* | ✓ done | [`e33ca6d`](../../commit/e33ca6d) |
 | 0 | NMI/spinlock deadlock fix via `irq_work`, scoped to CPU 3 | ✓ done | [`c2eb4b6`](../../commit/c2eb4b6) → [`e965a5b`](../../commit/e965a5b) |
-| 3 | Expand to 8 GP + 3 fixed counters (CPU 3 only) | **next** | — |
-| 4 | Paper-style verification at period=50,000 (CPU 3 only) | not started | — |
+| 3 | Expand to 8 GP + 3 fixed counters (CPU 3 only) | ✓ done | — |
+| 4 | Paper-style verification at period=50,000 (CPU 3 only) | **next** | — |
 
 Numbering follows the README's original plan; **Subtask 0** is the
 NMI/spinlock fix the README flagged as a prerequisite but did not design.
@@ -134,7 +134,7 @@ at period=50,000 + concurrent `dd` deadlocked all 4 vCPUs in earlier
 testing. Most likely the four `irq_work` callbacks contend on the
 `read_queue` wait-queue lock via `wake_up_all`. Not pursued.
 
-### Subtask 3 — counter expansion to 8 GP + 3 fixed (next)
+### Subtask 3 — counter expansion to 8 GP + 3 fixed (done)
 
 Goal: sample all 11 counters synchronously on every PMI on CPU 3, not
 just 4 GP + 1 fixed.
@@ -158,27 +158,52 @@ just 4 GP + 1 fixed.
   - `startCtrs()` builds `cfgs[0..7]` from the 8 sysfs attrs.
 - [`textreader.cpp`](textreader.cpp): print all 11 counters per row.
 
-**Verification:** reuse the Test A/B/C harness. Configure 8 events,
-microbench on CPU 3, `dd` a few buffers, decode the binary. Sanity
-check: all 11 counters non-zero with the right ordering;
-`gp[0]≈fixed[0]` if event 0 is INST_RETIRED.ANY (architectural — `gp`
-counts the same thing FIXED0 counts).
+**Verified** with the microbench + dd harness at period=100,000 on
+CPU 3: 10 buffers (40,960 bytes) read cleanly, 680 samples decoded,
+all 11 counters present per sample, `gp[7]` (INST_RETIRED.PREC_DIST)
+matched `fixed[0]` (INST_RETIRED.ANY) within ~0.02 % per sample —
+which incidentally surfaced the Skylake gotcha that
+INST_RETIRED.ANY at umask 0x00 only counts on FIXED0, not GP.
 
-### Subtask 4 — paper-style verification at period=50,000 (not started)
+**Pre-existing bug fixed along the way:**
+`sizeof(struct sample)` would have padded to 64 (8-byte alignment of
+`unsigned long cycles`), making `sizeof(struct buffer) = 4048 ≠
+BUFFER_SIZE = 4096`. With `dd bs=4096 iflag=fullblock`, dd's second
+read would have `count=48 < BUFFER_SIZE` and trip my_read's EINVAL
+guard. Fixed by `__attribute__((packed))` on `struct sample` so the
+size stays 60 and the buffer remains exactly 4096 bytes — same exact-fit
+property the original 4 GP + 1 fixed layout had.
+
+Also fixed a pre-existing missing `<unistd.h>` include in
+`textreader.cpp` (referenced `readlink` without it).
+
+### Subtask 4 — paper-style verification at period=50,000 (next)
 
 Configure these 8 architectural events on CPU 3 (encodings stable
 across all Intel generations from Skylake-SP through Alder Lake):
 
 | Idx | Event:Umask | Meaning | Cross-check |
 |---|---|---|---|
-| 0 | `0xC0:0x00` | INST_RETIRED.ANY | vs FIXED0 |
-| 1 | `0x3C:0x00` | CPU_CLK_UNHALTED.CORE | vs FIXED1 |
-| 2 | `0x3C:0x01` | CPU_CLK_UNHALTED.REF | vs FIXED2 |
+| 0 | `0xC0:0x01` | INST_RETIRED.PREC_DIST | vs FIXED0 |
+| 1 | `0x3C:0x00` | CPU_CLK_UNHALTED.THREAD_P | vs FIXED1 / `s->cycles - period` |
+| 2 | `0x3C:0x01` | CPU_CLK_UNHALTED.REF_TSC | vs FIXED2 |
 | 3 | `0xC4:0x00` | BR_INST_RETIRED.ALL | — |
 | 4 | `0xC5:0x00` | BR_MISP_RETIRED.ALL | rate `gp4/gp3` |
 | 5 | `0x2E:0x4F` | LONGEST_LAT_CACHE.REFERENCE | — |
 | 6 | `0x2E:0x41` | LONGEST_LAT_CACHE.MISS | rate `gp6/gp5` |
-| 7 | `0xC0:0x01` | INST_RETIRED.PREC_DIST | — |
+| 7 | `0xC0:0x00` | INST_RETIRED.ANY (FIXED0-only; reads as 0 here) | unused |
+
+**Skylake gotcha confirmed in Subtask 3 testing:** INST_RETIRED.ANY
+(`0xC0:0x00`) only increments on FIXED0 — it reads as 0 on a GP counter.
+For the GP-vs-FIXED0 cross-check use INST_RETIRED.PREC_DIST (`0xC0:0x01`)
+in slot 0; in the Subtask 3 verification the two matched within 0.02 %
+(`gp[7]=77617`, `fixed[0]=77633` per sample).
+
+**Cycle-counter cross-check methodology:** `s->fixed[1]` is the raw
+FIXED_CTR1 remainder *post*-overflow (`read_ccnt()` itself); the
+per-period delta lives in `s->cycles = read_ccnt() + period`. Compare
+`gp[1]` (PMC reset every NMI) against `s->cycles`, not against
+`s->fixed[1]`.
 
 Userspace writes `(umask << 8) | event` to `/sys/sync_pmu/0..7` (the
 module already masks `0xFFFF` and OR-s in USR/OS/EN bits).

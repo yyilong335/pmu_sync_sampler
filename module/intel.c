@@ -15,7 +15,7 @@ extern int  reserve_evntsel_nmi(unsigned int msr);
 extern void release_perfctr_nmi(unsigned int msr);
 extern void release_evntsel_nmi(unsigned int msr);
 
-unsigned long num_ctrs = 4;
+unsigned long num_ctrs = 8;
 
 uint64_t read_ccnt(void) {
 	uint64_t c;
@@ -26,6 +26,12 @@ uint64_t read_ccnt(void) {
 uint64_t read_pmn(unsigned i) {
 	uint64_t c;
 	rdmsrl(MSR_ARCH_PERFMON_PERFCTR0 + i, c);
+	return c;
+}
+
+uint64_t read_fixed(unsigned i) {
+	uint64_t c;
+	rdmsrl(MSR_ARCH_PERFMON_FIXED_CTR0 + i, c);
 	return c;
 }
 
@@ -71,14 +77,20 @@ static int my_nmi_handler(unsigned int cmd, struct pt_regs *regs)
 
     total_interrupts += 1;
 
-    wrmsrl(MSR_CORE_PERF_GLOBAL_OVF_CTRL, (1ULL << 63) | (1ULL << 62) | (0xF));
+    wrmsrl(MSR_CORE_PERF_GLOBAL_OVF_CTRL,
+            (1ULL << 63) | (1ULL << 62) | (7ULL << 32) | 0xFFULL);
 
     gatherSample();
 
+    /* Reset all 8 GP counters and FIXED_CTR0 / FIXED_CTR2 so the next
+     * sample reports a per-period delta (FIXED_CTR1 is reloaded below to
+     * drive the next overflow). */
     write_ccnt(0xFFFFFFFFFFFF - period);
     for (i=0; i<num_ctrs; i++) {
         wrmsrl(MSR_ARCH_PERFMON_PERFCTR0 + i, 0);
     }
+    wrmsrl(MSR_ARCH_PERFMON_FIXED_CTR0, 0);
+    wrmsrl(MSR_ARCH_PERFMON_FIXED_CTR0 + 2, 0);
 
     if (shutdown != 0) {
         wrmsrl(MSR_CORE_PERF_GLOBAL_CTRL, 0);
@@ -124,11 +136,14 @@ void startCtrsLocal(unsigned long* cfgs) {
 	    pmn_config(i, cfgs[i]); 
     }
 
-    wrmsrl(MSR_CORE_PERF_FIXED_CTR_CTRL, (0xAULL << 4));
+    /* FIXED_CTR_CTRL: FIXED0 OS|USR=0x3, FIXED1 OS|USR|PMI=0xB,
+     * FIXED2 OS|USR=0x3 → 0x3 | (0xB<<4) | (0x3<<8) = 0x3B3 */
+    wrmsrl(MSR_CORE_PERF_FIXED_CTR_CTRL, 0x3B3ULL);
 
     wrmsrl(MSR_CORE_PERF_GLOBAL_OVF_CTRL,
-            (1ULL << 63) | (1ULL << 62) | (1ULL << 33) | (0xF));
-    wrmsrl(MSR_CORE_PERF_GLOBAL_CTRL, 0xF | (1ULL << 33));
+            (1ULL << 63) | (1ULL << 62) | (7ULL << 32) | 0xFFULL);
+    /* Enable PMC0..7 + FIXED_CTR0..2 */
+    wrmsrl(MSR_CORE_PERF_GLOBAL_CTRL, 0xFFULL | (7ULL << 32));
 }
 
 int initialize_arch(void) {
@@ -145,7 +160,7 @@ int initialize_arch(void) {
         return -EBUSY;
     }
 
-    num_ctrs = 4;
+    num_ctrs = 8;
 
     return 0;
 }

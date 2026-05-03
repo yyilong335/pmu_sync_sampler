@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <cassert>
 #include <stdint.h>
+#include <unistd.h>
 
 #include <fstream>
 #include <streambuf>
@@ -73,12 +74,16 @@ void outputBuffer(struct buffer& b) {
 	for (size_t i=0; i<b.num_samples; i++) {
 		struct sample& c = b.samples[i];
 		ProcessInfo& pi = getProcessInfo(c.pid);
-		printf("%lu,%u,%lu,%u,%u,%u,%u,%u,%u,%s,%s\n", 
+		printf("%lu,%u,%lu,"
+		       "%u,%u,%u,%u,%u,%u,%u,%u,"  // gp[0..7]
+		       "%u,%u,%u,"                  // fixed[0..2]
+		       "%s,%s\n",
 			c.pid, b.core, c.cycles,
-			c.counters[0], c.counters[1], c.counters[2], 
-			c.counters[3], c.counters[4], c.counters[5],
+			c.gp[0], c.gp[1], c.gp[2], c.gp[3],
+			c.gp[4], c.gp[5], c.gp[6], c.gp[7],
+			c.fixed[0], c.fixed[1], c.fixed[2],
 			pi.cmdline.c_str(), pi.executable.c_str());
-	}	
+	}
 }
 
 int main(int argc, const char** argv) {

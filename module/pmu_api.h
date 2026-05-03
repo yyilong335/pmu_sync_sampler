@@ -12,6 +12,7 @@
 extern unsigned long num_ctrs;
 uint64_t read_ccnt(void);
 uint64_t read_pmn(unsigned);
+uint64_t read_fixed(unsigned);
 int initialize_arch(void);
 void cleanup_arch(void);
 void startCtrsLocal(unsigned long *);

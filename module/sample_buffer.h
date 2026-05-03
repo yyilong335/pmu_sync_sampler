@@ -6,12 +6,19 @@ extern "C" {
 #endif
 
 #define BUFFER_SIZE (4*1024)
+#define NUM_GP_COUNTERS    8
+#define NUM_FIXED_COUNTERS 3
 
+/* Packed so sizeof(struct sample) stays at 60 bytes -- otherwise the
+ * compiler pads to 64 (8-byte alignment of `unsigned long`), BUFFER_ENTRIES
+ * drops from 68 to 63, sizeof(struct buffer) becomes 4048, and userspace
+ * read(bs=BUFFER_SIZE) trips my_read's `count < BUFFER_SIZE` check. */
 struct sample {
     unsigned long cycles;
     unsigned long pid;
-    unsigned int counters[6];
-};
+    unsigned int gp[NUM_GP_COUNTERS];
+    unsigned int fixed[NUM_FIXED_COUNTERS];
+} __attribute__((packed));
 
 #define BUFFER_ENTRIES ((BUFFER_SIZE - 12) / sizeof(struct sample))
 struct buffer {

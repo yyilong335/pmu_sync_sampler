@@ -208,6 +208,30 @@ static struct int_attr ctr3_attr = {
     .value = 0,
 };
 
+static struct int_attr ctr4_attr = {
+    .attr.name="4",
+    .attr.mode = 0644,
+    .value = 0,
+};
+
+static struct int_attr ctr5_attr = {
+    .attr.name="5",
+    .attr.mode = 0644,
+    .value = 0,
+};
+
+static struct int_attr ctr6_attr = {
+    .attr.name="6",
+    .attr.mode = 0644,
+    .value = 0,
+};
+
+static struct int_attr ctr7_attr = {
+    .attr.name="7",
+    .attr.mode = 0644,
+    .value = 0,
+};
+
 
 static void initialize_buffer(struct buffer* b) {
     b->core = smp_processor_id();
@@ -252,8 +276,11 @@ void gatherSample(void) {
     s->cycles = read_ccnt();
     s->cycles += period;
     s->pid = current->pid;
-    for (i=0; i<num_ctrs; i++) {
-        s->counters[i] = read_pmn(i);
+    for (i=0; i<NUM_GP_COUNTERS; i++) {
+        s->gp[i] = read_pmn(i);
+    }
+    for (i=0; i<NUM_FIXED_COUNTERS; i++) {
+        s->fixed[i] = read_fixed(i);
     }
 
     if (b->num_samples >= BUFFER_ENTRIES) {
@@ -267,11 +294,15 @@ void gatherSample(void) {
 static void startCtrs(void* d) {
     unsigned int proc = smp_processor_id();
     struct buffer *fresh;
-    unsigned long cfgs[6] = {
+    unsigned long cfgs[NUM_GP_COUNTERS] = {
         ctr0_attr.value,
         ctr1_attr.value,
         ctr2_attr.value,
-        ctr3_attr.value
+        ctr3_attr.value,
+        ctr4_attr.value,
+        ctr5_attr.value,
+        ctr6_attr.value,
+        ctr7_attr.value,
     };
     printk(KERN_ERR "Configuring PMU on core %u\n", proc);
 
@@ -343,6 +374,10 @@ static struct attribute *myattr_attrs[] = {
     &ctr1_attr.attr,
     &ctr2_attr.attr,
     &ctr3_attr.attr,
+    &ctr4_attr.attr,
+    &ctr5_attr.attr,
+    &ctr6_attr.attr,
+    &ctr7_attr.attr,
     NULL
 };
 ATTRIBUTE_GROUPS(myattr);
