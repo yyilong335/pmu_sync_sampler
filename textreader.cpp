@@ -87,19 +87,26 @@ void outputBuffer(struct buffer& b) {
 }
 
 int main(int argc, const char** argv) {
-	FILE* f = fopen("/dev/pmu_samples", "rb");
-	if (f == NULL) {
-		perror("Error opening samples device:");
-		return -1;
-	}	
+	const char* path = (argc > 1) ? argv[1] : "/dev/pmu_samples";
+	FILE* f;
+	if (string(path) == "-") {
+		f = stdin;
+	} else {
+		f = fopen(path, "rb");
+		if (f == NULL) {
+			perror("Error opening samples device:");
+			return -1;
+		}
+	}
 
 	while (!feof(f)) {
 		struct buffer b;
 		size_t rc = fread(&b, sizeof(struct buffer), 1, f);
+		if (rc != 1) break;
 		outputBuffer(b);
 	}
 
-	fclose(f);
+	if (f != stdin) fclose(f);
 
-	return 0;	
+	return 0;
 }

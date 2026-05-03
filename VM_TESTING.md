@@ -52,6 +52,26 @@ sampling safe to enable, Subtasks 3/4 expand and validate it).
   ```
   Then for sampling: see "Test harness" below.
 
+### GP event selection — `events.conf`
+
+The 8 GP counters are programmed from [`events.conf`](events.conf), one
+non-comment line per slot, format `<NAME> <(umask<<8)|event>`. Slots
+beyond the last entry are zeroed (counter is enabled but `EVENT=0` is
+"no event"). The 3 fixed counters are always-on
+(INST_RETIRED.ANY, CPU_CLK_UNHALTED.CORE, CPU_CLK_UNHALTED.REF_TSC) and
+not user-configurable. Default set (Skylake-SP):
+
+| Slot | Name | Encoding | Event |
+|---|---|---|---|
+| 0 | L1D_LOAD       | 0x81D0 | MEM_INST_RETIRED.ALL_LOADS |
+| 1 | L1D_STORE      | 0x82D0 | MEM_INST_RETIRED.ALL_STORES |
+| 2 | BR_INST_ALL    | 0x00C4 | BR_INST_RETIRED.ALL_BRANCHES |
+| 3 | L1D_READ_MISS  | 0x08D1 | MEM_LOAD_RETIRED.L1_MISS |
+| 4 | L1I_MISS       | 0x0283 | ICACHE_64B.IFTAG_MISS |
+
+Edit `events.conf` to change the set; [`start_sampler.sh`](start_sampler.sh)
+loads the module, sets `period`, writes each slot, and starts sampling.
+
 ---
 
 ## Subtask details
@@ -237,33 +257,42 @@ agree on the same cycle count, every sample, every run, to within
 
 ### Two characteristics worth understanding before running on bare metal
 
-**1. cycle inflation** (≈25 % above `period`). With period=50,000,
-`s->cycles` lands at ~62,800 instead of ~50,000. Two causes:
+**1. cycle inflation in the VM is purely KVM PMI overhead** —
+**not** turbo. Period sweep with host turbo disabled
+([`prepare_for_benchmarking.sh`](prepare_for_benchmarking.sh) run on
+the host beforehand, `cpu MHz: 2600.000` confirmed), microbench on
+CPU 3, default `events.conf`, 3 runs per period:
 
-* **Host turbo on the KVM passthrough.** Bastion at base 2.6 GHz vs
-  turbo ~3.2 GHz = 1.23× factor — exactly the inflation we see. On
-  bare metal with turbo disabled
-  ([prepare_for_benchmarking.sh](prepare_for_benchmarking.sh)), this
-  factor goes away.
-* **KVM PMI delivery latency** (~1,000 cycles per PMI). Each PMI
-  exits to KVM, gets re-injected, and only then enters our handler —
-  the counter keeps ticking through that. Bare metal has sub-microsecond
-  PMI dispatch.
+| period   | cyc_mean | overhead    | cross-run stdev | fix1 (post-handler) |
+|----------|----------|-------------|-----------------|----------------------|
+| 50,000   | 62,434   | **+12,434** | 35              | ~17,500 |
+| 100,000  | 112,347  | **+12,347** | 67              | ~17,400 |
+| 500,000  | 512,403  | **+12,403** | 46              | ~17,400 |
+| 1,000,000| 1,012,413| **+12,413** | 38              | ~17,500 |
 
-In-run stdev is ~500 cycles → small KVM jitter. Cross-run stdev of
-the *means* is 296 cycles → very stable.
+The overhead is **constant ~12,400 cycles across two orders of
+magnitude of period**. That can only be virtualization cost (PMI
+exit-to-KVM + re-inject + handler entry on the guest); turbo cannot
+produce a constant absolute offset, only a multiplicative factor.
+Also note: even with turbo on or off the inflation was the same
+(~12K cycles), confirming turbo is not the dominant factor on this
+host's KVM. **On bare metal** with sub-microsecond PMI delivery,
+expect `cyc ≈ period` to within a few hundred cycles.
 
-**2. PMC0/PREC_DIST cross-check is non-deterministic on KVM.**
-INST_RETIRED.PREC_DIST (`0xC0:0x01`) on PMC0 was the cleanest
-cross-check against FIXED0 in one run (mean ratio 0.9970, see commit
-`000be4f`), but in a later 5-run repeat PMC0 stayed at 0 even though
-EVENTSEL0 was correctly programmed. Best guess: a Skylake/KVM
-counter-resource arbitration with another PEBS-capable event, or
-perf_events grabbing PMC0 between our `rmmod` and next `insmod` even
-with the watchdog off. The synchronous sampler itself is fine —
-`gp[1]/cyc` and the rate-based cross-checks are stable across all
-runs. Treat the PREC_DIST/PMC0 path as "works on bare metal, flaky
-under KVM."
+`fix1` (`s->fixed[1]`, raw FIXED_CTR1 read after the 8 GP-counter
+`rdmsrl`s) sits at ~17,400 — that's the further "in-handler" cycles
+spent reading 8 GP MSRs in NMI context. Also a fixed VM cost.
+
+In-run stdev is ~500 cycles; cross-run stdev of the means is now
+**35–67 cycles** at all periods — extremely stable.
+
+**2. PMC0/PREC_DIST flakiness from earlier runs is gone** with the
+new event set in `events.conf`. The original Subtask 4 set put
+`INST_RETIRED.PREC_DIST` (`0xC0:0x01`) on PMC0, which was
+intermittently zero on KVM (Skylake/KVM PEBS-counter arbitration).
+The current 5-event set (loads/stores/branches/L1D-miss/L1I-miss)
+uses no PEBS-precise events on PMC0 and reads stable values across
+all runs and all periods (gp[0] stdev ~10 across runs at any period).
 
 ### Buffer-pool throughput note
 
@@ -401,29 +430,28 @@ Two userspace pieces work together with the module:
   [`textreader.cpp`](textreader.cpp)) — drains `full_buffers` from
   userspace so the buffer pool doesn't saturate.
 
-Standard Subtask 0 verification run:
+Standard run (current — uses [`start_sampler.sh`](start_sampler.sh)
+and [`events.conf`](events.conf)):
 
 ```bash
-sudo insmod ~/pmu_sync_sampler/module/pmu_sync_sample.ko
-for i in 0 1 2 3; do echo $((0xC0)) | sudo tee /sys/sync_pmu/$i; done
-echo 50000 | sudo tee /sys/sync_pmu/period
-
-echo 1 | sudo tee /sys/sync_pmu/status
-~/pmu_sync_sampler/microbench 6 &              # CPU 3 workload
-taskset -c 0 sudo dd if=/dev/pmu_samples \
-    of=/tmp/samples.bin bs=4096 iflag=fullblock count=20 status=none
-wait
-echo 0 | sudo tee /sys/sync_pmu/status
-
+cd ~/pmu_sync_sampler
+sudo ./start_sampler.sh 50000                  # default events.conf
+sudo dd if=/dev/pmu_samples of=/tmp/samples.bin \
+    bs=4096 iflag=fullblock count=64 status=none &
+taskset -c 3 ./microbench &                    # workload on CPU 3
+wait %1
+sudo bash -c "echo 0 > /sys/sync_pmu/status"
 cat /sys/sync_pmu/missed
-grep NMI /proc/interrupts                      # only CPU 3 should grow
 sudo rmmod pmu_sync_sample
+
+# Decode (textreader takes a binary file path as argv[1])
+./textreader /tmp/samples.bin > /tmp/samples.csv
 ```
 
-Decode `samples.bin` with the same script used in the Subtask 0
-verification (16-byte buffer header: `int core; int num_samples; ptr`;
-then `num_samples × 40-byte sample = ulong cycles + ulong pid + uint
-counters[6]`). Subtask 3 will widen this to 60 bytes per sample.
+Each CSV row is:
+`pid, core, cyc, gp[0..7], fixed[0..2], cmdline, executable`. With
+the default `events.conf` that's
+`pid, core, cyc, L1D_LOAD, L1D_STORE, BR_INST_ALL, L1D_READ_MISS, L1I_MISS, 0, 0, 0, INST_RETIRED.ANY, CPU_CLK_UNHALTED.CORE, CPU_CLK_UNHALTED.REF_TSC, ...`.
 
 ### Single-CPU verification results (Subtask 0)
 
