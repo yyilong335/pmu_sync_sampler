@@ -13,3 +13,5 @@ microbench_mem
 samples.bin
 samples_review.csv
 samples_review_summary.txt
+preflight.log
+preflight_dmesg.txt
