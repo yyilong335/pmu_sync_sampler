@@ -472,7 +472,7 @@ URL no longer has bootable kernel/initrd files — Ubuntu's server installer
 is Subiquity now. Use a cloud image instead:
 
 ```bash
-VMDIR=/var/tmp/kbh8sa-pmu-vm           # local disk; libvirt-qemu can't read NFS homes
+VMDIR=/var/tmp/$USER-pmu-vm            # local disk; libvirt-qemu can't read NFS homes
 mkdir -p $VMDIR && chgrp kvm $VMDIR && chmod 750 $VMDIR
 cd $VMDIR
 
