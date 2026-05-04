@@ -11,6 +11,33 @@ target is **Linux 5.15 / Intel Xeon Gold 6142 (Skylake-SP, SMT off, 8 GP
 > a "project context" section that summarizes hardware target, branch,
 > file map, and what's done.
 
+## Branches: original vs. modernized
+
+| Branch | What's on it |
+|---|---|
+| **`master`** | The **original** code (John Demme, 2.6.32-era) — last touched on Linux 2.6.32 / Intel Xeon 5550 (Nehalem). Used `register_die_notifier` for NMI, hardcoded char-device major 222, sampled 4 GP + 1 fixed counter, ARM/OMAP4 port still present. **Frozen reference**; don't add commits here without explicit approval. |
+| **`kernel-5.15`** | The **modernized** version this README describes. Linux 5.15, Skylake-SP, 8 GP + 3 fixed, irq_work-safe NMI, x2APIC LVTPC, udev-managed device, configurable events via `events.conf`. All current work goes here. |
+
+Concretely, `kernel-5.15` adds on top of `master`:
+
+| What changed | Where |
+|---|---|
+| NMI hook: `register_die_notifier` → `register_nmi_handler(NMI_LOCAL, …)` (Linux 4.x+ API) | [`module/intel.c`](module/intel.c) |
+| ARM/OMAP4 port dropped (dead `mach-omap2` headers) — Intel-only now | `module/arm.c` removed; `Makefile.intel` → `Makefile` |
+| Char device: `register_chrdev(222, …)` → `alloc_chrdev_region` + `cdev_init` + `class_create` + `device_create`. udev creates `/dev/pmu_samples` with a kernel-allocated major. | [`module/pmu_sync_sample_main.c`](module/pmu_sync_sample_main.c) |
+| **NMI/spinlock deadlock fix** (the original bug that hard-locked the host on modern many-core CPUs): NMI no longer takes `spin_lock_irqsave`; buffer hand-off deferred to `irq_work` running in normal IRQ context. | [`module/pmu_sync_sample_main.c`](module/pmu_sync_sample_main.c) |
+| **x2APIC `LVTPC`**: `native_apic_mem_write` → `apic_write` (the `_mem` variant silently no-ops under x2APIC, which is the default on modern KVM and Skylake-SP — the reason the first VM test reported `Interrupts taken: 0`). | [`module/intel.c`](module/intel.c) |
+| Sample 8 GP + 3 fixed counters per PMI (was 4 + 1). `MSR_CORE_PERF_GLOBAL_CTRL = 0xFF \| (7ULL<<32)`, `FIXED_CTR_CTRL = 0x3B3`, `struct sample` widened to `gp[8] + fixed[3]` and `__attribute__((packed))` so `sizeof(struct buffer) = BUFFER_SIZE` exactly. | [`module/intel.c`](module/intel.c), [`module/sample_buffer.h`](module/sample_buffer.h), [`module/pmu_sync_sample_main.c`](module/pmu_sync_sample_main.c) |
+| **CPU-3-only target**: `PMU_TARGET_CPU = 3`; arm/disarm via `smp_call_function_single` (was `on_each_cpu`). NMI handler returns `NMI_DONE` on every other CPU. | [`module/pmu_api.h`](module/pmu_api.h), [`module/intel.c`](module/intel.c), [`module/pmu_sync_sample_main.c`](module/pmu_sync_sample_main.c) |
+| **First-sample contamination fix**: `startCtrsLocal` now clears PERFCTR0..7, FIXED_CTR0, FIXED_CTR2 before re-enabling `GLOBAL_CTRL`, symmetric with the NMI handler's reset. Caught by per-sample sanity check (`STALL > cyc`). | [`module/intel.c`](module/intel.c) |
+| Wider eventsel encoding: `pmn_config` accepts CMask, Invert, edge bits (was masked to low 16). USR/OS/EN forced; INT cleared. | [`module/intel.c`](module/intel.c) |
+| Userspace tooling added: [`events.conf`](events.conf) (8-slot event config), [`start_sampler.sh`](start_sampler.sh) (load + arm + write events), [`microbench_mem.c`](microbench_mem.c) (memory-bound demo workload), [`prepare_for_benchmarking.sh`](prepare_for_benchmarking.sh) (turbo/watchdog/ASLR off). [`textreader`](textreader.cpp) now accepts a binary file path or `-` for stdin. | repo root |
+| Docs added: this README, [`CLAUDE.md`](CLAUDE.md) project-context section, [`SAMPLING_WORKFLOW.md`](SAMPLING_WORKFLOW.md), [`VM_TESTING.md`](VM_TESTING.md), [`event.md`](event.md). | repo root |
+
+Subtask-level history is in [`VM_TESTING.md`](VM_TESTING.md).
+Counter-semantics and variance analysis are in
+[`SAMPLING_WORKFLOW.md`](SAMPLING_WORKFLOW.md).
+
 ## Why this exists (vs. `perf`)
 
 `perf record -e a,b,c,d` round-robins events across counters when
