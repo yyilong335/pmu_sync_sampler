@@ -75,8 +75,8 @@ void outputBuffer(struct buffer& b) {
 		struct sample& c = b.samples[i];
 		ProcessInfo& pi = getProcessInfo(c.pid);
 		printf("%lu,%u,%lu,"
-		       "%u,%u,%u,%u,%u,%u,%u,%u,"  // gp[0..7]
-		       "%u,%u,%u,"                  // fixed[0..2]
+		       "%u,%u,%u,%u,%u,%u,%u,%u,"
+		       "%u,%u,%u,"
 		       "%s,%s\n",
 			c.pid, b.core, c.cycles,
 			c.gp[0], c.gp[1], c.gp[2], c.gp[3],

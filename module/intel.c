@@ -17,6 +17,11 @@ extern void release_evntsel_nmi(unsigned int msr);
 
 unsigned long num_ctrs = 8;
 
+/* Clear-all bits for MSR_CORE_PERF_GLOBAL_OVF_CTRL (write-1-to-clear):
+ * 63=CondChgd, 62=OvfBuffer, 32..34=FIXED0..2, 0..7=PMC0..7. */
+#define OVF_CTRL_CLEAR_ALL \
+    ((1ULL << 63) | (1ULL << 62) | (7ULL << 32) | 0xFFULL)
+
 uint64_t read_ccnt(void) {
 	uint64_t c;
 	rdmsrl(MSR_ARCH_PERFMON_FIXED_CTR1, c);
@@ -81,8 +86,7 @@ static int my_nmi_handler(unsigned int cmd, struct pt_regs *regs)
 
     total_interrupts += 1;
 
-    wrmsrl(MSR_CORE_PERF_GLOBAL_OVF_CTRL,
-            (1ULL << 63) | (1ULL << 62) | (7ULL << 32) | 0xFFULL);
+    wrmsrl(MSR_CORE_PERF_GLOBAL_OVF_CTRL, OVF_CTRL_CLEAR_ALL);
 
     gatherSample();
 
@@ -151,8 +155,7 @@ void startCtrsLocal(unsigned long* cfgs) {
      * FIXED2 OS|USR=0x3 → 0x3 | (0xB<<4) | (0x3<<8) = 0x3B3 */
     wrmsrl(MSR_CORE_PERF_FIXED_CTR_CTRL, 0x3B3ULL);
 
-    wrmsrl(MSR_CORE_PERF_GLOBAL_OVF_CTRL,
-            (1ULL << 63) | (1ULL << 62) | (7ULL << 32) | 0xFFULL);
+    wrmsrl(MSR_CORE_PERF_GLOBAL_OVF_CTRL, OVF_CTRL_CLEAR_ALL);
     /* Enable PMC0..7 + FIXED_CTR0..2 */
     wrmsrl(MSR_CORE_PERF_GLOBAL_CTRL, 0xFFULL | (7ULL << 32));
 }
