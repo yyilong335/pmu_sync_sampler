@@ -2,9 +2,7 @@
 
 A Linux kernel module + small userspace tools that **synchronously sample
 all configured PMU counters at a fixed cycle interval**. The current
-target is **Linux 5.15 / Intel Xeon Gold 6142 (Skylake-SP, SMT off, 8 GP
-+ 3 fixed counters)**, sampling on **CPU 3 only**, with `period =
-50,000` cycles between PMIs.
+target is **Linux 5.15 / Intel Xeon Gold 6142 (Skylake-SP, SMT off, 8 GP + 3 fixed counters)**, sampling on **CPU 3 only**, with `period = 50,000` cycles between PMIs.
 
 > **Read this first if you're a new Claude / new contributor**:
 > [`CLAUDE.md`](CLAUDE.md) has the project's behavioral guidelines and
