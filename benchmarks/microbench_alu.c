@@ -12,7 +12,7 @@
 #include <time.h>
 #include <unistd.h>
 
-#define TARGET_CPU 3
+#define TARGET_CPU 2
 
 int main(int argc, char **argv)
 {

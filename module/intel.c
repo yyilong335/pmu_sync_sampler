@@ -15,7 +15,12 @@ extern int  reserve_evntsel_nmi(unsigned int msr);
 extern void release_perfctr_nmi(unsigned int msr);
 extern void release_evntsel_nmi(unsigned int msr);
 
-unsigned long num_ctrs = 8;
+/* Alder Lake P-core (Golden Cove) has 8 GP, but we start with 3 as a
+ * safety floor while bringing the driver up on a new uarch -- enough to
+ * get a sample with meaningful events but well below the architectural
+ * max so a stray PMC slot can't fault. Bump back to 8 once the basic
+ * pipeline is verified on this part. */
+unsigned long num_ctrs = 3;
 
 uint64_t read_ccnt(void) {
 	uint64_t c;
@@ -153,8 +158,10 @@ void startCtrsLocal(unsigned long* cfgs) {
 
     wrmsrl(MSR_CORE_PERF_GLOBAL_OVF_CTRL,
             (1ULL << 63) | (1ULL << 62) | (7ULL << 32) | 0xFFULL);
-    /* Enable PMC0..7 + FIXED_CTR0..2 */
-    wrmsrl(MSR_CORE_PERF_GLOBAL_CTRL, 0xFFULL | (7ULL << 32));
+    /* Enable PMC0..2 + FIXED_CTR0..2 only. PMC3..7 stay disabled in
+     * GLOBAL_CTRL so unprogrammed slots can't increment, and gatherSample
+     * still reads them via rdmsrl but they return 0. */
+    wrmsrl(MSR_CORE_PERF_GLOBAL_CTRL, 0x07ULL | (7ULL << 32));
 }
 
 int initialize_arch(void) {
@@ -171,7 +178,7 @@ int initialize_arch(void) {
         return -EBUSY;
     }
 
-    num_ctrs = 8;
+    num_ctrs = 3;
 
     return 0;
 }

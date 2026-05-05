@@ -14,5 +14,7 @@ benchmarks/microbench_alu
 samples.bin
 results/*.csv
 results/*.txt
+results/*.log
+results/*.err
 preflight.log
 preflight_dmesg.txt

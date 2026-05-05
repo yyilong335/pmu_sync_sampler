@@ -11,7 +11,7 @@
 #include <time.h>
 #include <unistd.h>
 
-#define TARGET_CPU 3
+#define TARGET_CPU 2
 #define LINE       64
 #define BUF_BYTES  (16ULL * 1024 * 1024)        /* 16 MB > L2 (1 MB), < LLC (22 MB) */
 #define NUM_LINES  (BUF_BYTES / LINE)
