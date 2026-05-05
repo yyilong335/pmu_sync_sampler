@@ -24,10 +24,12 @@ void process_packet(struct packet_header head,
 	printf("<< cmd:  %s; exe:  %s >>\n", cmdline, exe);
 	for (size_t i=0; i<head.quantity; i++) {
 		struct sample c = samples[i];
-		printf("\t(%lu): %u,%u,%u,%u,%u,%u\n",
+		printf("\t(%lu): %u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u\n",
 			c.cycles,
 			c.counters[0], c.counters[1], c.counters[2],
-			c.counters[3], c.counters[4], c.counters[5]);
+			c.counters[3], c.counters[4], c.counters[5],
+			c.counters[6], c.counters[7],
+			c.counters[8], c.counters[9], c.counters[10]);
 	}
 	printf("\n");
 }

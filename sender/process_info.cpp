@@ -6,6 +6,7 @@
 
 #include <stdlib.h>
 #include <stdio.h>
+#include <unistd.h>   /* readlink(2); newer GCC no longer pulls this in transitively */
 
 #include <fstream>
 #include <streambuf>

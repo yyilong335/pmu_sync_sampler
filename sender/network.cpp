@@ -7,6 +7,7 @@
 #include <string.h>
 #include <error.h>
 #include <stdlib.h>
+#include <unistd.h>   /* close(2); newer GCC no longer pulls this in transitively */
 
 #include "packet.h"
 #include "process_info.h"

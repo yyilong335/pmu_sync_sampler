@@ -161,17 +161,22 @@ public:
 			struct sample c = samples[i];
 			switch (outputFormat) {
 				case Text:
-					fprintf(currFile, "%lu,%u,%u,%u,%u,%u,%u\n",
+					fprintf(currFile,
+						"%lu,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u\n",
 						c.cycles,
 						c.counters[0], c.counters[1], c.counters[2],
-						c.counters[3], c.counters[4], c.counters[5]);
+						c.counters[3], c.counters[4], c.counters[5],
+						c.counters[6], c.counters[7],
+						c.counters[8], c.counters[9], c.counters[10]);
 					break;
 				case Binary: {
-					uint32_t nums[7] = {
+					uint32_t nums[12] = {
 						(uint32_t)c.cycles,
 						c.counters[0], c.counters[1], c.counters[2],
-						c.counters[3], c.counters[4], c.counters[5] };
-					fwrite(nums, sizeof(uint32_t), 7, currFile);
+						c.counters[3], c.counters[4], c.counters[5],
+						c.counters[6], c.counters[7],
+						c.counters[8], c.counters[9], c.counters[10] };
+					fwrite(nums, sizeof(uint32_t), 12, currFile);
 					break;
 				}
 				default:

@@ -7,7 +7,7 @@
 #include "packet.h"
 #include "process_info.h"
 
-#define NUM_COUNTERS (6)
+#define NUM_COUNTERS (NUM_GP_COUNTERS + NUM_FIXED_COUNTERS)
 
 static struct {
 	void *ptr;

@@ -12,12 +12,22 @@ extern "C" {
 /* Packed so sizeof(struct sample) stays at 60 bytes -- otherwise the
  * compiler pads to 64 (8-byte alignment of `unsigned long`), BUFFER_ENTRIES
  * drops from 68 to 63, sizeof(struct buffer) becomes 4048, and userspace
- * read(bs=BUFFER_SIZE) trips my_read's `count < BUFFER_SIZE` check. */
+ * read(bs=BUFFER_SIZE) trips my_read's `count < BUFFER_SIZE` check.
+ *
+ * `gp[]` + `fixed[]` and `counters[]` overlap the same 11×uint32 region
+ * via an anonymous union: kernel + textreader use the named views,
+ * sender/reader treat all 11 slots as a flat array (same convention as
+ * master's counters[6], just widened). */
 struct sample {
     unsigned long cycles;
     unsigned long pid;
-    unsigned int gp[NUM_GP_COUNTERS];
-    unsigned int fixed[NUM_FIXED_COUNTERS];
+    union {
+        struct {
+            unsigned int gp[NUM_GP_COUNTERS];
+            unsigned int fixed[NUM_FIXED_COUNTERS];
+        };
+        unsigned int counters[NUM_GP_COUNTERS + NUM_FIXED_COUNTERS];
+    };
 } __attribute__((packed));
 
 #define BUFFER_ENTRIES ((BUFFER_SIZE - 12) / sizeof(struct sample))

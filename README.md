@@ -29,6 +29,8 @@ Concretely, `kernel-5.15` adds on top of `master`:
 | **CPU-3-only target**: `PMU_TARGET_CPU = 3`; arm/disarm via `smp_call_function_single` (was `on_each_cpu`). NMI handler returns `NMI_DONE` on every other CPU. | [`module/pmu_api.h`](module/pmu_api.h), [`module/intel.c`](module/intel.c), [`module/pmu_sync_sample_main.c`](module/pmu_sync_sample_main.c) |
 | **First-sample contamination fix**: `startCtrsLocal` now clears PERFCTR0..7, FIXED_CTR0, FIXED_CTR2 before re-enabling `GLOBAL_CTRL`, symmetric with the NMI handler's reset. Caught by per-sample sanity check (`STALL > cyc`). | [`module/intel.c`](module/intel.c) |
 | Wider eventsel encoding: `pmn_config` accepts CMask, Invert, edge bits (was masked to low 16). USR/OS/EN forced; INT cleared. | [`module/intel.c`](module/intel.c) |
+| **`lbuffer == NULL` recovery**: NMI's miss path now also queues `irq_work` so buffers returned to `empty_buffers` while `lbuffer` was NULL get picked up promptly. Otherwise a brief reader stall (>10 ms) could leave the sampler stuck even after the reader catches up. | [`module/pmu_sync_sample_main.c`](module/pmu_sync_sample_main.c) |
+| **sender/reader updated to 8 GP + 3 fixed**: anonymous union exposes `gp[8] + fixed[3]` and `counters[11]` over the same memory; sender/reader use the flat `counters[]` view (same convention as master's `counters[6]`, just widened). Two pre-existing missing `<unistd.h>` includes added so `sender/` builds on modern GCC. | [`module/sample_buffer.h`](module/sample_buffer.h), [`sender/`](sender/), [`reader/`](reader/) |
 | Userspace tooling added: [`events.conf`](events.conf) (8-slot event config), [`start_sampler.sh`](start_sampler.sh) (load + arm + write events), [`microbench_mem.c`](microbench_mem.c) (memory-bound demo workload), [`prepare_for_benchmarking.sh`](prepare_for_benchmarking.sh) (turbo/watchdog/ASLR off). [`textreader`](textreader.cpp) now accepts a binary file path or `-` for stdin. | repo root |
 | Docs added: this README, [`CLAUDE.md`](CLAUDE.md) project-context section, [`SAMPLING_WORKFLOW.md`](SAMPLING_WORKFLOW.md), [`VM_TESTING.md`](VM_TESTING.md), [`event.md`](event.md). | repo root |
 
@@ -103,16 +105,6 @@ sampling. **Don't push to master without explicit approval.**
   CPU. Anything else using the PMU loses its counters. Should be
   scoped to only the counters and CPU we own, but doesn't crash
   anything. Defer.
-- **Latent `lbuffer == NULL` recovery hole**: if a reader stalls long
-  enough to drain the 8-buffer pool (~10 ms at period=50K), `gatherSample`
-  on `b == NULL` only bumps `missed` and doesn't queue
-  `irq_work` — buffers freed back into the pool by a later read can't
-  get picked up. Tight readers (`textreader`, `sender`) never trigger
-  this. One-line fix available; left out of this branch.
-- **`sender/`, `reader/` wire format still encodes 6 counters** and
-  will silently truncate the 8 GP + 3 fixed sample. `textreader` is the
-  reference reader for now; fix `sender/protocol.txt` if you bring TCP
-  shipping back online.
 
 ## Documentation map
 

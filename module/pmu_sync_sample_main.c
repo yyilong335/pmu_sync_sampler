@@ -265,10 +265,14 @@ void gatherSample(void) {
     unsigned i;
 
     /* NMI context: cannot take blist spinlocks. If no buffer is
-     * available locally, drop the sample and let the deferred
-     * irq_work refill us before the next PMI. */
+     * available locally, drop the sample and queue irq_work so the
+     * deferred callback can refill `lbuffer` from `empty_buffers` --
+     * otherwise buffers returned to the pool by `my_read` while we're
+     * stuck would never be picked up (only the buffer-full path
+     * queues irq_work, and we never get there with b == NULL). */
     if (b == NULL) {
         missed_attr.value += 1;
+        irq_work_queue(this_cpu_ptr(&pmu_irqwk));
         return;
     }
 
