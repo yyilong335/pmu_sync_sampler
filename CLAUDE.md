@@ -68,7 +68,7 @@ Strong success criteria let you loop independently. Weak criteria ("make it work
 
 # Project context: pmu_sync_sampler
 
-A Linux kernel module for synchronous PMU sampling. Read [`README.md`](README.md) for the architecture, quick-start, and file map; this section is the minimum a new agent needs to make correct decisions about *which* changes to attempt.
+A Linux kernel module for synchronous PMU sampling. Read [`README.md`](README.md) for the architecture, quick-start, and file map; [`ONBOARDING.md`](ONBOARDING.md) for cross-machine session handoff (recent commit history, verified IPC baselines, deferred known issues). This section is the minimum a new agent needs to make correct decisions about *which* changes to attempt.
 
 ## Hardware and target configuration
 
