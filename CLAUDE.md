@@ -124,9 +124,9 @@ Plus latent bugs found and fixed during VM testing: x2APIC `LVTPC` programming v
 The VM testing artifacts on the original development machine live in `/var/tmp/$USER-pmu-vm/` (libvirt staging, cloud-init seed, SSH keys). On a fresh machine these don't exist — set up a new VM following [`VM_TESTING.md`](VM_TESTING.md) "Setup recipe — VM from scratch", or skip straight to bare metal now that the unsafe paths are fixed.
 
 Local-only artifacts that aren't in git (gitignored):
-- `samples_review.csv`, `samples_review_summary.txt` — most-recent verification dumps
+- `results/*.csv`, `results/*.txt` — verification CSV dumps and summaries
 - `preflight.log`, `preflight_dmesg.txt` — most-recent preflight stress-test output
-- `microbench`, `microbench_mem`, `textreader` (binaries)
+- `benchmarks/microbench`, `benchmarks/microbench_mem`, `benchmarks/microbench_alu`, `textreader` (binaries)
 - `plans/` (local working notes)
 
 ## Workflow expectation

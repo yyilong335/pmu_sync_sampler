@@ -122,7 +122,7 @@ After the fix, every per-sample sanity check across 21,754 samples
 
 ### Top-7 GP event verification (5 runs at period=50,000)
 
-Workload: [`microbench_mem`](microbench_mem.c) (16 MB pointer-chase,
+Workload: [`microbench_mem`](benchmarks/microbench_mem.c) (16 MB pointer-chase,
 Fisher–Yates shuffled, > L2 < LLC) on CPU 3, with `dd` draining
 `/dev/pmu_samples` concurrently. Reader and workload start
 simultaneously — same pattern as master's `example_run.sh` (no warmup
@@ -199,13 +199,13 @@ bound loop.
 
 ### Per-sample CSV for review
 
-[`samples_review.csv`](samples_review.csv) (gitignored) is the full
+[`samples_review.csv`](results/samples_review.csv) (gitignored) is the full
 21,754-row dump from the 5-run verification. Columns:
 `run, sample_idx, pid, core, cyc, STALL_ISSUE, STALL_RETIRE, LOAD,
 STORE, BRANCH, L1D_REPLACEMENT, L1I_MISS, gp7_unused, INST_RETIRED,
 CPU_CLK_CORE, REF_TSC, cmdline, executable`. Use it to spot-check
 individual samples, look at distributions, or feed into your own
-analysis. [`samples_review_summary.txt`](samples_review_summary.txt)
+analysis. [`samples_review_summary.txt`](results/samples_review_summary.txt)
 holds the per-run summary, cross-run stability table, sanity
 checks, and head/middle/tail spot-checks of run 1.
 
@@ -531,7 +531,7 @@ cpuid -1 -l 0xa -r     # EDX low 5 bits = #fixed counters; expect 3
 git clone -b kernel-5.15 \
   https://github.com/yyilong335/pmu_sync_sampler.git ~/pmu_sync_sampler
 cd ~/pmu_sync_sampler/module && make
-gcc -O2 -Wall -o ../microbench ../microbench.c
+gcc -O2 -Wall -o ../benchmarks/microbench ../benchmarks/microbench.c
 ```
 
 ### 4. Snapshot a clean state
@@ -559,7 +559,7 @@ virsh -c qemu:///system start pmu-test
 
 Two userspace pieces work together with the module:
 
-- [`microbench.c`](microbench.c) — pinned to CPU 3, runs a tight ALU loop
+- [`microbench.c`](benchmarks/microbench.c) — pinned to CPU 3, runs a tight ALU loop
   for N seconds (default 10). Provides a deterministic workload so
   `FIXED_CTR1` actually ticks and the PMI rate approaches its rated
   cadence.
@@ -575,7 +575,7 @@ cd ~/pmu_sync_sampler
 sudo ./start_sampler.sh 50000                  # default events.conf
 sudo dd if=/dev/pmu_samples of=/tmp/samples.bin \
     bs=4096 iflag=fullblock count=64 status=none &
-taskset -c 3 ./microbench &                    # workload on CPU 3
+taskset -c 3 ./benchmarks/microbench &         # workload on CPU 3
 wait %1
 sudo bash -c "echo 0 > /sys/sync_pmu/status"
 cat /sys/sync_pmu/missed

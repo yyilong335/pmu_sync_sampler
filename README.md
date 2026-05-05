@@ -31,7 +31,7 @@ Concretely, `kernel-5.15` adds on top of `master`:
 | Wider eventsel encoding: `pmn_config` accepts CMask, Invert, edge bits (was masked to low 16). USR/OS/EN forced; INT cleared. | [`module/intel.c`](module/intel.c) |
 | **`lbuffer == NULL` recovery**: NMI's miss path now also queues `irq_work` so buffers returned to `empty_buffers` while `lbuffer` was NULL get picked up promptly. Otherwise a brief reader stall (>10 ms) could leave the sampler stuck even after the reader catches up. | [`module/pmu_sync_sample_main.c`](module/pmu_sync_sample_main.c) |
 | **sender/reader updated to 8 GP + 3 fixed**: anonymous union exposes `gp[8] + fixed[3]` and `counters[11]` over the same memory; sender/reader use the flat `counters[]` view (same convention as master's `counters[6]`, just widened). Two pre-existing missing `<unistd.h>` includes added so `sender/` builds on modern GCC. | [`module/sample_buffer.h`](module/sample_buffer.h), [`sender/`](sender/), [`reader/`](reader/) |
-| Userspace tooling added: [`events.conf`](events.conf) (8-slot event config), [`start_sampler.sh`](start_sampler.sh) (load + arm + write events), [`microbench_mem.c`](microbench_mem.c) (memory-bound demo workload), [`prepare_for_benchmarking.sh`](prepare_for_benchmarking.sh) (turbo/watchdog/ASLR off). [`textreader`](textreader.cpp) now accepts a binary file path or `-` for stdin. | repo root |
+| Userspace tooling added: [`events.conf`](events.conf) (8-slot event config), [`start_sampler.sh`](start_sampler.sh) (load + arm + write events), [`microbench_mem.c`](benchmarks/microbench_mem.c) (memory-bound demo workload), [`prepare_for_benchmarking.sh`](prepare_for_benchmarking.sh) (turbo/watchdog/ASLR off). [`textreader`](textreader.cpp) now accepts a binary file path or `-` for stdin. | repo root |
 | Docs added: this README, [`CLAUDE.md`](CLAUDE.md) project-context section, [`SAMPLING_WORKFLOW.md`](SAMPLING_WORKFLOW.md), [`VM_TESTING.md`](VM_TESTING.md), [`event.md`](event.md). | repo root |
 
 Subtask-level history is in [`VM_TESTING.md`](VM_TESTING.md).
@@ -65,14 +65,14 @@ cd ..
 
 # 3. Build userspace.
 make textreader             # the local CSV viewer
-gcc -O2 -Wall -o microbench_mem microbench_mem.c   # memory-bound demo workload
+gcc -O2 -Wall -o benchmarks/microbench_mem benchmarks/microbench_mem.c   # memory-bound demo workload
 
 # 4. Arm the sampler with the events listed in events.conf, period=50,000.
 sudo ./start_sampler.sh 50000
 
 # 5. Run a workload on CPU 3 and drain samples concurrently.
 sudo ./textreader > /tmp/samples.csv &
-taskset -c 3 ./microbench_mem 10 1
+taskset -c 3 ./benchmarks/microbench_mem 10 1
 sudo bash -c "echo 0 > /sys/sync_pmu/status"
 sudo rmmod pmu_sync_sample
 
@@ -204,8 +204,8 @@ events.conf                        ─ GP event set (read by start_sampler.sh)
 start_sampler.sh                   ─ insmod, set period, write events, status=1
 example_run.sh, stop.sh            ─ legacy run scripts (master-era; not on hot path)
 prepare_for_benchmarking.sh        ─ pin freq, disable turbo/watchdog/ASLR
-microbench.c                       ─ ALU-bound workload pinned to CPU 3
-microbench_mem.c                   ─ memory-bound workload (16 MB pointer chase) pinned to CPU 3
+benchmarks/                        ─ workloads pinned to CPU 3 (microbench, microbench_mem, microbench_alu)
+results/                           ─ sample CSVs + summaries from verification runs (gitignored)
 textreader.cpp                     ─ reads /dev/pmu_samples, prints CSV (or replays from file via argv[1])
 exercise1.cpp, hello.cpp           ─ legacy test programs from the original repo
 module/

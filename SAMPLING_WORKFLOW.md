@@ -7,7 +7,7 @@ identifies why no counter we read can equal `period` exactly.
 
 ## Where things run
 
-- **Workload**: `taskset -c 3 ./microbench_mem` runs entirely on
+- **Workload**: `taskset -c 3 ./benchmarks/microbench_mem` runs entirely on
   CPU 3 in user mode (Ring 3).
 - **Kernel module**: only programs PMU MSRs on CPU 3
   (`smp_call_function_single(PMU_TARGET_CPU, …)` for arm/disarm).
