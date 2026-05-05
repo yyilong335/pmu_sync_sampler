@@ -74,39 +74,30 @@ void outputBuffer(struct buffer& b) {
 	for (size_t i=0; i<b.num_samples; i++) {
 		struct sample& c = b.samples[i];
 		ProcessInfo& pi = getProcessInfo(c.pid);
-		printf("%lu,%u,%lu,"
-		       "%u,%u,%u,%u,%u,%u,%u,%u,"
-		       "%u,%u,%u,"
-		       "%s,%s\n",
+		printf("%lu,%u,%lu,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%s,%s\n",
 			c.pid, b.core, c.cycles,
-			c.gp[0], c.gp[1], c.gp[2], c.gp[3],
-			c.gp[4], c.gp[5], c.gp[6], c.gp[7],
-			c.fixed[0], c.fixed[1], c.fixed[2],
+			c.counters[0], c.counters[1], c.counters[2],
+			c.counters[3], c.counters[4], c.counters[5],
+			c.counters[6], c.counters[7],
+			c.counters[8], c.counters[9], c.counters[10],
 			pi.cmdline.c_str(), pi.executable.c_str());
 	}
 }
 
 int main(int argc, const char** argv) {
-	const char* path = (argc > 1) ? argv[1] : "/dev/pmu_samples";
-	FILE* f;
-	if (string(path) == "-") {
-		f = stdin;
-	} else {
-		f = fopen(path, "rb");
-		if (f == NULL) {
-			perror("Error opening samples device:");
-			return -1;
-		}
+	FILE* f = fopen("/dev/pmu_samples", "rb");
+	if (f == NULL) {
+		perror("Error opening samples device:");
+		return -1;
 	}
 
 	while (!feof(f)) {
 		struct buffer b;
 		size_t rc = fread(&b, sizeof(struct buffer), 1, f);
-		if (rc != 1) break;
 		outputBuffer(b);
 	}
 
-	if (f != stdin) fclose(f);
+	fclose(f);
 
 	return 0;
 }

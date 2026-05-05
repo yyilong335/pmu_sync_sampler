@@ -281,10 +281,10 @@ void gatherSample(void) {
     s->cycles += period;
     s->pid = current->pid;
     for (i=0; i<NUM_GP_COUNTERS; i++) {
-        s->gp[i] = read_pmn(i);
+        s->counters[i] = read_pmn(i);
     }
     for (i=0; i<NUM_FIXED_COUNTERS; i++) {
-        s->fixed[i] = read_fixed(i);
+        s->counters[NUM_GP_COUNTERS + i] = read_fixed(i);
     }
 
     if (b->num_samples >= BUFFER_ENTRIES) {
