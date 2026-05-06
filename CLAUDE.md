@@ -119,6 +119,14 @@ Plus latent bugs found and fixed during VM testing: x2APIC `LVTPC` programming v
 - Comments only when WHY is non-obvious (hardware quirks, KVM artifacts, hidden constraints). The packed-struct comment in [`module/sample_buffer.h`](module/sample_buffer.h) is a model.
 - The user is an Intel-PMU researcher, not a kernel hacker. Frame explanations in terms of MSRs and counter semantics, not in terms of generic kernel internals.
 
+### Microbenchmarks: no watcher in the timed loop
+
+Benchmarks under [`benchmarks/`](benchmarks/) are observed by the synchronous PMU sampler — that *is* the measurement system. The benchmark itself must therefore not contain its own measurement infrastructure inside the timed kernel: no `clock_gettime`, `printf`, `gettimeofday`, syscalls, or FP elapsed-time math in the hot path. Self-instrumented benchmarks become dominated by their own watcher code rather than the compute kernel they claim to test.
+
+Default pattern for a compute-bound microbench: (1) iteration count from `argv` so the caller controls runtime; (2) inline `asm volatile (...)` around the kernel so `gcc -O2` can't strength-reduce or fold it; (3) accumulator digest emitted only *after* the timed loop. [`benchmarks/microbench_ipc.c`](benchmarks/microbench_ipc.c) is the canonical example. [`benchmarks/microbench_alu.c`](benchmarks/microbench_alu.c) is the negative example — its `for(;;){...; clock_gettime(...); if (elapsed>=N) break;}` shape let gcc fold the inner 1M-iter loop into a closed-form add and turned the bench into a `clock_gettime`-throughput test (measured 1.5 IPC instead of the intended ~3-4). Don't write new benchmarks in that shape; if extending an existing one, port it to the `microbench_ipc` shape first.
+
+Memory-bound benchmarks like [`benchmarks/microbench_mem.c`](benchmarks/microbench_mem.c) get away with the old shape because the data dependency through `p = p->next` blocks gcc from folding the loop. Don't take that as license to keep the pattern — it's still wrong, just not destructively wrong there.
+
 ## Test infrastructure (per-machine, not in git)
 
 The VM testing artifacts on the original development machine live in `/var/tmp/$USER-pmu-vm/` (libvirt staging, cloud-init seed, SSH keys). On a fresh machine these don't exist — set up a new VM following [`VM_TESTING.md`](VM_TESTING.md) "Setup recipe — VM from scratch", or skip straight to bare metal now that the unsafe paths are fixed.
@@ -126,7 +134,7 @@ The VM testing artifacts on the original development machine live in `/var/tmp/$
 Local-only artifacts that aren't in git (gitignored):
 - `results/*.csv`, `results/*.txt` — verification CSV dumps and summaries
 - `preflight.log`, `preflight_dmesg.txt` — most-recent preflight stress-test output
-- `benchmarks/microbench`, `benchmarks/microbench_mem`, `benchmarks/microbench_alu`, `textreader` (binaries)
+- `benchmarks/microbench`, `benchmarks/microbench_mem`, `benchmarks/microbench_alu`, `benchmarks/microbench_ipc`, `textreader` (binaries)
 - `plans/` (local working notes)
 
 ## Workflow expectation

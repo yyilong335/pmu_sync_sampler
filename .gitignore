@@ -11,6 +11,7 @@ plans/
 benchmarks/microbench
 benchmarks/microbench_mem
 benchmarks/microbench_alu
+benchmarks/microbench_ipc
 samples.bin
 results/*.csv
 results/*.txt

@@ -1,6 +1,10 @@
 #!/bin/bash
 # Bundled smoke test for branch adl on Alder Lake.
-# Run as: sudo bash adl_smoke.sh 2>&1 | tee results/adl_smoke.log
+# Run as:
+#   sudo bash adl_smoke.sh                       # default: microbench_alu, 3s
+#   sudo BENCH=./benchmarks/microbench_ipc \
+#        BENCH_ARGS=5000000000 \
+#        bash adl_smoke.sh                       # override workload
 #
 # Order of operations matters: textreader has to be blocked on read
 # BEFORE sampling starts, otherwise NMIs fill the 8-buffer pool with
@@ -10,8 +14,12 @@ set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
 cd "$HERE"
 
-CSV="$HERE/results/adl_smoke.csv"
-TR_ERR="$HERE/results/adl_smoke_tr.err"
+BENCH="${BENCH:-./benchmarks/microbench_alu}"
+BENCH_ARGS="${BENCH_ARGS:-3}"
+BENCH_NAME="$(basename "$BENCH")"
+
+CSV="$HERE/results/adl_${BENCH_NAME}.csv"
+TR_ERR="$HERE/results/adl_${BENCH_NAME}.tr.err"
 KO="$HERE/module/pmu_sync_sample.ko"
 USER_NAME="${SUDO_USER:-kbh8sa}"
 
@@ -67,8 +75,8 @@ echo "textreader pid=$TR_PID"
 echo "=== arm sampler (status=1) ==="
 echo 1 > /sys/sync_pmu/status
 
-echo "=== run microbench_alu on CPU 2 for 3s ==="
-taskset -c 2 ./benchmarks/microbench_alu 3
+echo "=== run $BENCH_NAME on CPU 2 (args: $BENCH_ARGS) ==="
+taskset -c 2 "$BENCH" $BENCH_ARGS
 
 echo "=== stop sampler; textreader will hit EOF and exit on its own ==="
 echo 0 > /sys/sync_pmu/status
@@ -84,21 +92,23 @@ head -3 "$CSV"
 echo "--- last 3 csv rows ---"
 tail -3 "$CSV"
 
-ALU_ROWS=$(grep -c 'microbench_alu$' "$CSV" || true)
-echo "rows whose exe ends in microbench_alu: $ALU_ROWS"
+BENCH_ROWS=$(grep -c "${BENCH_NAME}\$" "$CSV" || true)
+echo "rows whose exe ends in $BENCH_NAME: $BENCH_ROWS"
 echo "distinct pids in csv:"
 awk -F, '{print $1}' "$CSV" | sort -u | head
 
-echo "--- column means over microbench_alu rows (cycles, c0..c10) ---"
-awk -F, '/microbench_alu$/ {
+echo "--- column means over $BENCH_NAME rows (cycles, c0..c10) ---"
+awk -F, -v bench="$BENCH_NAME" '
+$0 ~ bench"$" {
     n++; cyc+=$3
     for (i=4; i<=14; i++) s[i]+=$i
 }
 END {
-    if (n==0) { print "  (no microbench_alu rows -- something wrong)"; exit }
+    if (n==0) { printf "  (no %s rows -- something wrong)\n", bench; exit }
     printf "  n=%d  cyc=%.0f", n, cyc/n
     for (i=4; i<=14; i++) printf "  c%d=%.1f", i-4, s[i]/n
     print ""
+    printf "  IPC (c8/cyc) = %.3f\n", s[12]/cyc
 }' "$CSV"
 
 echo "=== dmesg tail ==="
