@@ -1,10 +1,10 @@
 #!/bin/bash
-# Bundled smoke test for branch adl on Alder Lake.
+# Bundled smoke test for branch skl on Skylake-SP / Xeon Gold 6142 (bastion).
 # Run as:
-#   sudo bash adl_smoke.sh                       # default: microbench_alu, 3s
+#   sudo bash skl_smoke.sh                       # default: microbench_alu, 3s
 #   sudo BENCH=./benchmarks/microbench_ipc \
 #        BENCH_ARGS=5000000000 \
-#        bash adl_smoke.sh                       # override workload
+#        bash skl_smoke.sh                       # override workload
 #
 # Order of operations matters: textreader has to be blocked on read
 # BEFORE sampling starts, otherwise NMIs fill the 8-buffer pool with
@@ -18,8 +18,8 @@ BENCH="${BENCH:-./benchmarks/microbench_alu}"
 BENCH_ARGS="${BENCH_ARGS:-3}"
 BENCH_NAME="$(basename "$BENCH")"
 
-CSV="$HERE/results/adl_${BENCH_NAME}.csv"
-TR_ERR="$HERE/results/adl_${BENCH_NAME}.tr.err"
+CSV="$HERE/results/skl_${BENCH_NAME}.csv"
+TR_ERR="$HERE/results/skl_${BENCH_NAME}.tr.err"
 KO="$HERE/module/pmu_sync_sample.ko"
 USER_NAME="${SUDO_USER:-kbh8sa}"
 
@@ -75,8 +75,8 @@ echo "textreader pid=$TR_PID"
 echo "=== arm sampler (status=1) ==="
 echo 1 > /sys/sync_pmu/status
 
-echo "=== run $BENCH_NAME on CPU 2 (args: $BENCH_ARGS) ==="
-taskset -c 2 "$BENCH" $BENCH_ARGS
+echo "=== run $BENCH_NAME on CPU 3 (args: $BENCH_ARGS) ==="
+taskset -c 3 "$BENCH" $BENCH_ARGS
 
 echo "=== stop sampler; textreader will hit EOF and exit on its own ==="
 echo 0 > /sys/sync_pmu/status

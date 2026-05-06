@@ -17,7 +17,7 @@
 #include <stdlib.h>
 #include <unistd.h>
 
-#define TARGET_CPU 2
+#define TARGET_CPU 3
 
 int main(int argc, char **argv)
 {

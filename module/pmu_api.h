@@ -7,10 +7,10 @@
  * `taskset -c PMU_TARGET_CPU ./prog`; counters on other CPUs are not
  * configured and the NMI handler ignores NMIs from those CPUs.
  *
- * Alder Lake i5-1240P: P-cores are 0/2/4/6 (HT siblings 1/3/5/7 are
- * offline with SMT disabled). The original CPU 3 was CPU 2's HT
- * sibling; CPU 2 is the natural replacement on this hybrid part. */
-#define PMU_TARGET_CPU 2
+ * Skylake-SP / Xeon Gold 6142 (bastion): 16 physical cores, SMT off
+ * so all 16 CPUs are independent. CPU 3 has been the target across
+ * all the kernel-5.15 verification runs. */
+#define PMU_TARGET_CPU 3
 
 // Provided in architecture-specific c file
 extern unsigned long num_ctrs;
