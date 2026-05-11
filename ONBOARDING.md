@@ -243,22 +243,146 @@ and `microbench_ipc`) finish with `missed=0` and no oops/WARN. Per-PMI
 overhead is ~2,000 cycles (4% of period) — comparable to adl, ~6×
 cheaper than KVM. Sampler attribution is 99.86%+ for the workload PID.
 
-CSVs are committed to `results/skl_microbench_alu.{csv,log}` and
-`results/skl_microbench_ipc.{csv,log}` ... actually no, `results/*.csv`
-is gitignored. Re-generate locally with the smoke commands above.
+CSVs land in `results/skl_microbench_alu.{csv,log}` and
+`results/skl_microbench_ipc.{csv,log}`. `results/*.csv` is gitignored,
+so regenerate locally via the smoke commands above. (We may want to
+opt-in commit a subset of microbench CSVs under `results/microbench/{adl,skl}/`
+for the cross-uarch comparison — see "Open questions" below.)
 
-### Next experiments
+### Open questions worth digging into next
 
-- Drive `microbench_ipc` toward the architectural ceiling with an
-  unrolled / AVX2 / wider-asm body — the current ~2.5 IPC is loop-overhead
-  bound on Skylake-SP, not sampler-bound. Worth confirming we can hit
-  closer to 4 IPC (4-wide retire) with a tighter kernel.
-- Real workload sampling on bastion: pick a target program (e.g. SPEC
-  CPU, a database hot loop) and verify the counter mix matches `perf
-  stat` independently. Demonstrates the sampler at its intended use.
-- Persist the VTune-driver-unload step. They auto-load via systemd at
-  every boot; either mask the service or add the rmmod to
-  `prepare_for_benchmarking.sh`.
+These are the analytical or ergonomic gaps that, if left, will bite us
+later. Listed in roughly the order they should be tackled.
+
+#### 1. Per-PMI overhead — why ~2,000 cycles instead of ≤500?
+
+Measured `cyc` mean is 52,055 (microbench_alu) and 52,143 (microbench_ipc)
+at period=50,000. So **handler entry latency ≈ 2,000 cycles**, ~4% of
+period. Earlier projection from the adl branch (~1,000 cycles on Golden
+Cove) was used to extrapolate ≤500 for Skylake-SP — the extrapolation
+was wrong. Things to look at:
+
+- **PMI delivery itself** is hardware: FIXED_CTR1 overflow → APIC LVTPC
+  vector → CPU pipeline drain → NMI. Skylake-SP's NMI path is longer
+  than Golden Cove's (older uarch, more serialization in the pipeline
+  drain). This is the irreducible floor.
+- **NMI handler prologue** (kernel-side, before our handler is called):
+  reg-save, gs-swap, IST stack switch. Same on adl; should be small.
+- **Our handler before `read_ccnt`**:
+  ```c
+  total_interrupts += 1;
+  wrmsrl(MSR_CORE_PERF_GLOBAL_OVF_CTRL, ...);   // 1 MSR write
+  gatherSample();                                // function call
+    // inside gatherSample:
+    smp_processor_id()                           // per-CPU lookup
+    per_cpu(lbuffer, proc)                       // per-CPU read
+    s = &b->samples[b->num_samples++];           // pointer arith
+    s->cycles = read_ccnt();                     // 1 MSR read
+  ```
+  This is ~5–10 instructions plus 1 wrmsrl (serializing, ~50 cycles on
+  Skylake) plus 1 rdmsr (~40 cycles). Adds ~150–200 cycles total.
+- **So the unexplained ~1,500 cycles** is most likely all PMI-delivery
+  hardware path. To confirm: read TSC at NMI entry and again at
+  read_ccnt; compute the delta. If it's ~1,500, we know it's not our
+  code. (Doesn't change anything — just makes the documentation honest.)
+
+This overhead is *consistent* across runs and uncorrelated with the
+workload counters, so it doesn't bias samples. But it sets a floor on
+how tightly `cyc` can equal `period`, which matters if someone wants
+"50,000-cycle samples" literally. Honesty in docs > optimistic projection.
+
+#### 2. Stability characterization — variance within and between runs
+
+We've reported only the *mean* `cyc` per run. What's missing:
+
+- **Within-run variance**: percentile spread (p1 / p50 / p99) of `cyc`
+  across the ~100k–400k samples. If p99–p1 is small (say <100 cycles)
+  the sampler is rock-steady; if it's wide (>1000) something jittery is
+  happening (NMI deferral under load, cache misses on the handler text,
+  cross-CPU IPIs landing on CPU 3).
+- **Between-run variance**: run the smoke 5× back-to-back, compare run
+  means. Aim is to demonstrate the mean is repeatable to within ~10
+  cycles. This is the same kind of "CV%" table we produced in the VM
+  validation; missing for bastion.
+- Workload counters (INST, BRANCH, LOAD) will naturally drift more
+  between runs than `cyc` does — that drift is workload-side noise, not
+  sampler noise.
+
+#### 3. CSV header row
+
+`textreader` currently emits raw rows: `pid,core,cyc,c0,c1,...,c10,cmd,exe`.
+A header line would make CSVs self-documenting. Two design choices to
+make first:
+
+- **Where**: print once in `main()` before the read loop. Costs one
+  printf per `textreader` invocation.
+- **Match-master tension**: master's textreader emits no header. Adding
+  it unconditionally diverges. Options:
+  (a) always print header — clean, deviates from master;
+  (b) gate behind `--header` flag or `PMU_HEADER=1` env var — preserves
+      master behavior by default;
+  (c) only print if stdout is a regular file (not a pipe / TTY) —
+      magic, but covers the "saving to CSV" case without affecting pipes.
+  Probably (a) is best; downstream analysis benefits from it and the
+  diff vs master is one line.
+
+#### 4. skl vs adl IPC comparison — likely uarch, but worth proving
+
+`microbench_ipc` numbers diverge cleanly:
+
+| branch | uarch | retire width | IPC |
+|---|---|---:|---:|
+| adl  | Golden Cove (Alder Lake P) | 6-wide | 5.155 |
+| skl  | Skylake-SP                  | 4-wide | 2.530 |
+
+Ratio 2.04, larger than the simple retire-width ratio 6/4 = 1.5. The
+extra factor comes from: (a) Golden Cove has more ALU ports for simple
+adds (5 vs 4), (b) wider rename / dispatch, (c) probably L1-uop-cache
+behavior since the inner loop is tiny. Not a sampler defect — but
+*right now we can't prove that from this repo*, because adl CSVs aren't
+checked in.
+
+**Action**: create `results/microbench/{adl,skl}/` and stash both
+branches' CSVs there for side-by-side analysis. The diff is purely
+analytical, not driver code. (Gitignore currently has `results/*.csv`
+— we'd need a more specific rule to allow tracked CSVs in the
+microbench subtree, or just opt these in via `git add -f`.)
+
+#### 5. VTune-driver auto-unload integration
+
+Currently the operator has to remember to:
+
+```bash
+sudo rmmod socwatch2_16 vtsspp sep5 pax
+```
+
+before each session, or `skl_smoke.sh` falls back to its precheck error.
+Options for making this permanent:
+
+- (a) **Add `rmmod` to `prepare_for_benchmarking.sh`** at the top. Pros:
+  no new artifact; runs once per session as documented. Cons: per-boot
+  resurrection means you re-run prepare each boot anyway.
+- (b) **Mask the systemd unit** that auto-loads them. The unit name needs
+  discovery — likely `/etc/systemd/system/multi-user.target.wants/sep*.service`
+  or `pax.service`; `systemctl list-unit-files | grep -iE 'sep|pax|vtss'`
+  will show. `systemctl mask <unit>` makes it survive reboots, no rmmod
+  needed afterward. Cons: bastion may have other users who actually use
+  VTune — masking surprises them.
+- (c) **Leave manual, document only.** Status quo + clear instructions.
+  Cons: easy to forget; the 90-second-stall failure is opaque.
+
+Recommendation: do (a) for the immediate session-level fix and consider
+(b) only after confirming nobody on bastion needs VTune. Either way,
+*don't* `rmmod` from `skl_smoke.sh` itself — the smoke script's job is
+"if preconditions hold, run; otherwise error fast," not "fix the host."
+
+#### 6. SPEC CPU sampling (user will add commands)
+
+Real-workload validation. Pick a SPEC binary, run it under
+`taskset -c 3` with the sampler armed, cross-check counter totals
+against `perf stat -e <same events> -- <same binary>`. Numbers should
+agree to within sampler-overhead error. This is the goalpost that makes
+the sampler "real" for research use.
 
 ### Deferred (still not blocking)
 

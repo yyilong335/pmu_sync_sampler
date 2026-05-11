@@ -88,23 +88,83 @@ cat /sys/sync_pmu/missed     # 0 if reader kept up
 | 1 | Modernize for Linux 5.15 (NMI API, sysfs, `module_init`) | ✓ done |
 | 2 | udev-managed `/dev/pmu_samples` (kernel-allocated major) | ✓ done |
 | 3 | Sample 8 GP + 3 fixed counters per PMI on CPU 3 | ✓ done |
-| 4 | Paper-style verification at `period = 50,000` | ✓ done (in VM) |
+| 4 | Paper-style verification at `period = 50,000` | ✓ done (KVM + Alder Lake bare metal + Skylake-SP bare metal) |
 | 0 | Fix latent NMI/spinlock deadlock via `irq_work` (was the bug that hard-locked the original host) | ✓ done |
 | — | x2APIC `LVTPC` programming via `apic_write` (was a latent xAPIC-only assumption) | ✓ done |
 | — | Reset PERFCTR / FIXED_CTR0 / FIXED_CTR2 in `startCtrsLocal` (first-sample contamination) | ✓ done |
 | — | Configurable GP event set via `events.conf` + `start_sampler.sh` | ✓ done |
+| — | Bare-metal validation on Alder Lake (`adl` branch) | ✓ done |
+| — | Bare-metal validation on Skylake-SP / bastion (`skl` branch) | ✓ done (2026-05-11) |
 
-Active branch: **`kernel-5.15`**. The `master` branch carries Subtasks 0/1/2
-+ pre-existing work but not Subtasks 3/4 / events.conf / fixed-counter
-sampling. **Don't push to master without explicit approval.**
+**Branches**: `master` (frozen reference), `kernel-5.15` (common ancestor
+for the per-uarch ports), `adl` (Alder Lake i5-1240P, `PMU_TARGET_CPU=2`),
+`skl` (Skylake-SP / bastion, `PMU_TARGET_CPU=3`). Driver code is identical
+across `kernel-5.15` / `adl` / `skl`; only HW-specific values differ.
+**Don't push to `master` without explicit approval.**
 
-### Known issues, not blocking bare-metal validation
+### Where we are (2026-05-11)
+
+The sampler works correctly on bare-metal Skylake-SP at the paper's
+period of 50,000 cycles. Two smoke runs at that period — a memory-walk
+bench and a tight ALU bench — produced 134k + 424k samples each, with
+`missed=0`, no oops/WARN, and clean rmmod. The driver's `irq_work` fix
+is now exercised on a 16-core bare-metal host without deadlocking. See
+[`ONBOARDING.md`](ONBOARDING.md) for the per-PMI overhead, IPC reference
+numbers, and the bastion-specific gotchas (stale `.ko` vermagic, Intel
+VTune driver auto-load, running KVM guests reserving PMC0).
+
+### Open questions / next steps
+
+These are the things we want to refine before declaring the sampler
+"production ready" for real workload measurement:
+
+- **Per-PMI overhead is ~2,000 cycles on Skylake-SP, not the ≤500 we
+  projected.** Measured `cyc` mean is ~52,100 at period=50,000.
+  Investigate where the time goes — PMI delivery hardware latency, NMI
+  handler prologue, the LVTPC re-arm, MSR-read serialization. Compare to
+  Alder Lake's ~1,000 cycles to see what's uarch-inherent vs. fixable.
+- **Stability characterization.** We have one run per bench right now.
+  Quantify within-run `cyc` variance (p1/p50/p99 spread) and between-run
+  drift (5+ back-to-back invocations). Currently only the bisected `cyc`
+  mean is reported.
+- **CSV header row.** `textreader` emits raw rows with no header.
+  Adding one (`pid,core,cyc,c0,c1,...,c10,cmdline,exe`) would make
+  downstream analysis less fragile. Trade-off: deviates from master's
+  format — gate behind a `--header` flag or env var to keep the default
+  matching master.
+- **Bastion VTune-driver auto-unload.** `pax`, `sep5`, `vtsspp`,
+  `socwatch2_16` load via systemd at every boot and steal PMC0. Today
+  you `sudo rmmod` them manually before each session. Options:
+  (a) integrate `rmmod` into `prepare_for_benchmarking.sh`,
+  (b) mask the systemd unit that loads them,
+  (c) leave it manual but document. We've punted; pick a path.
+- **skl vs adl IPC analysis.** `microbench_ipc` reaches 5.155 IPC on
+  Alder Lake P-core (Golden Cove, 6-wide retire) but only 2.530 on
+  Skylake-SP (4-wide retire). Worth a side-by-side: same bench, same
+  build, both branches' CSVs in `results/microbench/{adl,skl}/`,
+  comparison written up so we can rule out a sampler regression vs.
+  pure uarch effect. Currently the adl CSVs are not in this repo at all.
+- **SPEC CPU sampling** (user will add commands). Real-workload
+  validation — pick a SPEC binary, sample it via the harness, cross-check
+  counter sums against `perf stat` to demonstrate parity with the
+  industry-standard tool.
+
+### Known issues, not blocking ongoing work
 
 - **`stopAll()` clobbers global PMU state on every CPU at `rmmod`**:
   writes `MSR_CORE_PERF_GLOBAL_CTRL = 0` and masks `LVTPC` on every
   CPU. Anything else using the PMU loses its counters. Should be
   scoped to only the counters and CPU we own, but doesn't crash
   anything. Defer.
+- **VTune drivers stalled `insmod` for ~90 s on bastion** when loaded
+  (Intel's `pax` PMU arbiter intercepts `reserve_perfctr_nmi`). Now
+  guarded by a precheck in `skl_smoke.sh`, but the underlying conflict
+  is intrinsic — both drivers want the same MSRs.
+- **Stale `.ko` from a different kernel version** silently loads on
+  Ubuntu (`MODULE_VERMAGIC_MODVERSIONS`) but corrupts kernel state
+  invisibly, eventually triggering BMC hard-reset. Discovered the hard
+  way on bastion. Documented in ONBOARDING.md preflight; consider
+  adding a vermagic-vs-`uname -r` guard to the smoke script.
 
 ## Documentation map
 
