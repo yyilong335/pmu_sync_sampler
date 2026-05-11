@@ -132,12 +132,12 @@ These are the things we want to refine before declaring the sampler
   downstream analysis less fragile. Trade-off: deviates from master's
   format — gate behind a `--header` flag or env var to keep the default
   matching master.
-- **Bastion VTune-driver auto-unload.** `pax`, `sep5`, `vtsspp`,
-  `socwatch2_16` load via systemd at every boot and steal PMC0. Today
-  you `sudo rmmod` them manually before each session. Options:
-  (a) integrate `rmmod` into `prepare_for_benchmarking.sh`,
-  (b) mask the systemd unit that loads them,
-  (c) leave it manual but document. We've punted; pick a path.
+- ~~**Bastion VTune-driver auto-unload.**~~ Done: `prepare_for_benchmarking.sh`
+  now `rmmod`s `socwatch2_16`, `vtsspp`, `sep5`/`sep5_59`, `pax` (in stack
+  order, idempotent) so one `sudo ./prepare_for_benchmarking.sh` per
+  session is enough. The auto-load via systemd at boot still happens —
+  if anyone else on bastion needs VTune, masking the systemd unit is the
+  alternative, but for now we just unload at session prep time.
 - **skl vs adl IPC analysis.** `microbench_ipc` reaches 5.155 IPC on
   Alder Lake P-core (Golden Cove, 6-wide retire) but only 2.530 on
   Skylake-SP (4-wide retire). Worth a side-by-side: same bench, same

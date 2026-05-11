@@ -59,6 +59,18 @@ if ! grep -q "^kernel.nmi_watchdog=0" /etc/sysctl.conf; then
     echo "kernel.nmi_watchdog=0" | sudo tee -a /etc/sysctl.conf >/dev/null
 fi
 
+# Unload Intel VTune / SEP / SoC-Watch drivers if loaded. They auto-load
+# via systemd at boot on bastion and reserve PMC0 via the "pax" PMU
+# arbiter, which makes `insmod pmu_sync_sample.ko` hang ~90 s before
+# returning EBUSY. Unload in stack order (consumers first, arbiter last).
+# Idempotent: skips any module that isn't loaded.
+for mod in socwatch2_16 vtsspp sep5 sep5_59 pax; do
+    if lsmod | grep -q "^$mod "; then
+        echo "  unloading $mod"
+        sudo rmmod "$mod" 2>/dev/null || echo "    rmmod $mod failed (in use?)"
+    fi
+done
+
 # Disable ASLR so per-run cache placement is deterministic (otherwise
 # L1D_REPLACEMENT / L1I_MISS counts wobble run-to-run as code/data land
 # on different cache sets each invocation).

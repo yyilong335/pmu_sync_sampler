@@ -348,33 +348,19 @@ analytical, not driver code. (Gitignore currently has `results/*.csv`
 — we'd need a more specific rule to allow tracked CSVs in the
 microbench subtree, or just opt these in via `git add -f`.)
 
-#### 5. VTune-driver auto-unload integration
+#### 5. VTune-driver auto-unload integration — DONE (option a)
 
-Currently the operator has to remember to:
+`prepare_for_benchmarking.sh` now iterates over `socwatch2_16`, `vtsspp`,
+`sep5`, `sep5_59`, `pax` and `rmmod`s any that are loaded. Idempotent;
+skips modules that aren't there. One `sudo ./prepare_for_benchmarking.sh`
+per boot is now sufficient to clear the PMU. `skl_smoke.sh`'s precheck
+guard stays as a belt-and-suspenders error path for anyone who runs the
+smoke without prep.
 
-```bash
-sudo rmmod socwatch2_16 vtsspp sep5 pax
-```
-
-before each session, or `skl_smoke.sh` falls back to its precheck error.
-Options for making this permanent:
-
-- (a) **Add `rmmod` to `prepare_for_benchmarking.sh`** at the top. Pros:
-  no new artifact; runs once per session as documented. Cons: per-boot
-  resurrection means you re-run prepare each boot anyway.
-- (b) **Mask the systemd unit** that auto-loads them. The unit name needs
-  discovery — likely `/etc/systemd/system/multi-user.target.wants/sep*.service`
-  or `pax.service`; `systemctl list-unit-files | grep -iE 'sep|pax|vtss'`
-  will show. `systemctl mask <unit>` makes it survive reboots, no rmmod
-  needed afterward. Cons: bastion may have other users who actually use
-  VTune — masking surprises them.
-- (c) **Leave manual, document only.** Status quo + clear instructions.
-  Cons: easy to forget; the 90-second-stall failure is opaque.
-
-Recommendation: do (a) for the immediate session-level fix and consider
-(b) only after confirming nobody on bastion needs VTune. Either way,
-*don't* `rmmod` from `skl_smoke.sh` itself — the smoke script's job is
-"if preconditions hold, run; otherwise error fast," not "fix the host."
+We did not mask the systemd unit (option b) — bastion may have other
+users who actually want VTune. If that turns out not to be the case,
+`systemctl list-unit-files | grep -iE 'sep|pax|vtss'` shows the candidate
+units and `systemctl mask <unit>` would make the absence permanent.
 
 #### 6. SPEC CPU sampling (user will add commands)
 
