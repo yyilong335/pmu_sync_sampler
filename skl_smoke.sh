@@ -32,6 +32,26 @@ echo "online CPUs: $(cat /sys/devices/system/cpu/online)"
 echo "branch: $(git rev-parse --abbrev-ref HEAD 2>/dev/null)"
 
 echo "=== preflight: ensure clean ==="
+# Anything reserving PMC0 makes our reserve_perfctr_nmi() fail with EBUSY
+# and the cascade of "no such file" errors that follows is opaque. Check
+# the two known culprits up front:
+#   1. NMI watchdog with the legacy non-perf path.
+#   2. A running KVM guest with vPMU passthrough -- KVM holds the host's
+#      PMC0 to virtualize it for the guest. This is the leftover-VM trap.
+if [ "$(cat /proc/sys/kernel/nmi_watchdog 2>/dev/null)" = "1" ]; then
+    echo "ERROR: kernel.nmi_watchdog=1 -- it has reserved PMC0, insmod will fail." >&2
+    echo "       Fix: sudo ./prepare_for_benchmarking.sh   (also persists across reboot)" >&2
+    exit 1
+fi
+if command -v virsh >/dev/null 2>&1; then
+    running_guests=$(virsh list --name 2>/dev/null | sed '/^$/d' || true)
+    if [ -n "$running_guests" ]; then
+        echo "ERROR: KVM guest(s) running -- vPMU passthrough has reserved PMC0:" >&2
+        echo "$running_guests" | sed 's/^/       /' >&2
+        echo "       Fix: sudo virsh shutdown <name>   (or 'destroy' to force-stop)" >&2
+        exit 1
+    fi
+fi
 lsmod | grep -q '^pmu_sync_sample ' && rmmod pmu_sync_sample
 dmesg -C
 

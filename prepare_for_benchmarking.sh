@@ -48,9 +48,16 @@ fi
 # Disable thermal throttling
 sudo systemctl stop thermald
 
-# Disable watchdogs
+# Disable watchdogs (persist so insmod doesn't fail with EBUSY after a reboot --
+# the NMI watchdog reserves PMC0, blocking reserve_perfctr_nmi in the module).
 sudo sysctl -w kernel.watchdog=0
 sudo sysctl -w kernel.nmi_watchdog=0
+if ! grep -q "^kernel.watchdog=0" /etc/sysctl.conf; then
+    echo "kernel.watchdog=0" | sudo tee -a /etc/sysctl.conf >/dev/null
+fi
+if ! grep -q "^kernel.nmi_watchdog=0" /etc/sysctl.conf; then
+    echo "kernel.nmi_watchdog=0" | sudo tee -a /etc/sysctl.conf >/dev/null
+fi
 
 # Disable ASLR so per-run cache placement is deterministic (otherwise
 # L1D_REPLACEMENT / L1I_MISS counts wobble run-to-run as code/data land
