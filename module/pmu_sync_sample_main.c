@@ -258,7 +258,7 @@ static void pmu_irq_work_fn(struct irq_work *work)
     }
 }
 
-void gatherSample(void) {
+void gatherSample(uint64_t entry_ccnt) {
     unsigned int proc = smp_processor_id();
     struct buffer* b = per_cpu(lbuffer, proc);
     struct sample* s;
@@ -280,6 +280,7 @@ void gatherSample(void) {
     s->cycles = read_ccnt();
     s->cycles += period;
     s->pid = current->pid;
+    s->handler_entry_ccnt = entry_ccnt;
     for (i=0; i<NUM_GP_COUNTERS; i++) {
         s->counters[i] = read_pmn(i);
     }

@@ -74,12 +74,13 @@ void outputBuffer(struct buffer& b) {
 	for (size_t i=0; i<b.num_samples; i++) {
 		struct sample& c = b.samples[i];
 		ProcessInfo& pi = getProcessInfo(c.pid);
-		printf("%lu,%u,%lu,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%s,%s\n",
+		printf("%lu,%u,%lu,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%s,%s\n",
 			c.pid, b.core, c.cycles,
 			c.counters[0], c.counters[1], c.counters[2],
 			c.counters[3], c.counters[4], c.counters[5],
 			c.counters[6], c.counters[7],
 			c.counters[8], c.counters[9], c.counters[10],
+			c.handler_entry_ccnt,
 			pi.cmdline.c_str(), pi.executable.c_str());
 	}
 }

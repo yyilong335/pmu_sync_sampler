@@ -9,15 +9,20 @@ extern "C" {
 #define NUM_GP_COUNTERS    8
 #define NUM_FIXED_COUNTERS 3
 
-/* Packed: without it sizeof(struct sample) pads from 60 to 64,
- * BUFFER_ENTRIES drops, and sizeof(struct buffer) no longer equals
- * BUFFER_SIZE -- userspace read(bs=BUFFER_SIZE) trips my_read's
- * count < BUFFER_SIZE check. counters[0..NUM_GP_COUNTERS-1] are
- * GP slots; counters[NUM_GP_COUNTERS..] are FIXED_CTR0..2. */
+/* Packed: keeps sizeof(struct sample) at 64 (no struct padding) so
+ * sizeof(struct buffer) <= BUFFER_SIZE -- userspace read(bs=BUFFER_SIZE)
+ * trips my_read's count < BUFFER_SIZE check otherwise. counters[0..7]
+ * are GP slots; counters[8..10] are FIXED_CTR0..2.
+ *
+ * handler_entry_ccnt is the FIXED_CTR1 value captured at the very top
+ * of the NMI handler (before any other work), i.e. cycles since the
+ * PMI overflow when our handler first got CPU time. Subtract this
+ * from (cycles - period) to isolate "kernel/our handler prologue" cost. */
 struct sample {
     unsigned long cycles;
     unsigned long pid;
     unsigned int counters[NUM_GP_COUNTERS + NUM_FIXED_COUNTERS];
+    unsigned int handler_entry_ccnt;
 } __attribute__((packed));
 
 #define BUFFER_ENTRIES ((BUFFER_SIZE - 12) / sizeof(struct sample))

@@ -26,7 +26,7 @@ void register_interrupt(void);
 void deregister_interrupt(void);
 
 // Used in architecture-specific interrupt
-void gatherSample(void);
+void gatherSample(uint64_t entry_ccnt);
 extern volatile uint64_t total_interrupts;
 extern uint64_t period;
 extern volatile unsigned char shutdown;

@@ -17,21 +17,26 @@ extern void release_evntsel_nmi(unsigned int msr);
 
 unsigned long num_ctrs = 8;
 
+/* rdpmc ECX encoding: bit 30 = "fixed counter" selector, bits 29..0 = index.
+ * Faster than rdmsr (~30 cyc vs ~130 cyc on Skylake-SP) because rdpmc
+ * doesn't fully serialize the pipeline. CR4.PCE is irrelevant in CPL=0. */
+#define RDPMC_FIXED  (1U << 30)
+
 uint64_t read_ccnt(void) {
 	uint64_t c;
-	rdmsrl(MSR_ARCH_PERFMON_FIXED_CTR1, c);
+	rdpmcl(RDPMC_FIXED | 1, c);   /* FIXED_CTR1 */
 	return c;
 }
 
 uint64_t read_pmn(unsigned i) {
 	uint64_t c;
-	rdmsrl(MSR_ARCH_PERFMON_PERFCTR0 + i, c);
+	rdpmcl(i, c);                  /* PMC i (GP) */
 	return c;
 }
 
 uint64_t read_fixed(unsigned i) {
 	uint64_t c;
-	rdmsrl(MSR_ARCH_PERFMON_FIXED_CTR0 + i, c);
+	rdpmcl(RDPMC_FIXED | i, c);    /* FIXED_CTR i */
 	return c;
 }
 
@@ -73,18 +78,26 @@ void dump_regs(void) {
 static int my_nmi_handler(unsigned int cmd, struct pt_regs *regs)
 {
     size_t i;
+    uint64_t entry_ccnt;
 
     /* Only the target CPU has counters armed; let NMIs on any other CPU
      * fall through to the watchdog / kgdb / etc. handlers. */
     if (smp_processor_id() != PMU_TARGET_CPU)
         return NMI_DONE;
 
+    /* Microbench: timestamp the absolute earliest moment of our handler.
+     * FIXED_CTR1 has been counting since the overflow that triggered this
+     * PMI, so its value here = "hardware PMI delivery + kernel NMI prologue"
+     * cost alone, before our handler does anything else. Stored in the
+     * sample for per-PMI overhead analysis. */
+    entry_ccnt = read_ccnt();
+
     total_interrupts += 1;
 
     wrmsrl(MSR_CORE_PERF_GLOBAL_OVF_CTRL,
             (1ULL << 63) | (1ULL << 62) | (7ULL << 32) | 0xFFULL);
 
-    gatherSample();
+    gatherSample(entry_ccnt);
 
     /* Reset all 8 GP counters and FIXED_CTR0 / FIXED_CTR2 so the next
      * sample reports a per-period delta (FIXED_CTR1 is reloaded below to
