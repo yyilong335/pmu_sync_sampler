@@ -69,17 +69,51 @@ ProcessInfo& getProcessInfo(unsigned long pid) {
 	return pi;
 }
 
+/* Per-CPU previous-sample state. Kernel no longer resets the 8 GP
+ * counters or FIXED_CTR0 / FIXED_CTR2 at handler exit, so the values in
+ * c.counters[0..8, 10] arrive monotonic-accumulating since arm. textreader
+ * computes per-PMI deltas via unsigned subtraction (mod 2^32 wraparound is
+ * the right behavior for sub-2^32 deltas, which all our event rates are).
+ * counters[9] is FIXED_CTR1's second read -- already per-PMI because
+ * write_ccnt reloads it every handler -- passed through raw. Same for
+ * cycles and handler_entry_ccnt. */
+struct CpuPrev {
+	unsigned int counters[NUM_GP_COUNTERS + NUM_FIXED_COUNTERS];
+	bool initialized;
+	CpuPrev() : initialized(false) {
+		for (int i = 0; i < NUM_GP_COUNTERS + NUM_FIXED_COUNTERS; i++)
+			counters[i] = 0;
+	}
+};
+
+unordered_map<unsigned int, CpuPrev> cpuPrev;
+
 void outputBuffer(struct buffer& b) {
 	assert(b.num_samples <= BUFFER_ENTRIES);
+	CpuPrev& prev = cpuPrev[b.core];
 	for (size_t i=0; i<b.num_samples; i++) {
 		struct sample& c = b.samples[i];
 		ProcessInfo& pi = getProcessInfo(c.pid);
+
+		/* First sample on this CPU: kernel set counters to 0 at arm, so
+		 * the raw value already IS the delta from arm-time. After that,
+		 * unsigned (a - b) gives the per-PMI count. counters[9] is left
+		 * raw (per-PMI by construction via write_ccnt). */
+		unsigned int d[NUM_GP_COUNTERS + NUM_FIXED_COUNTERS];
+		for (int j = 0; j < NUM_GP_COUNTERS + NUM_FIXED_COUNTERS; j++) {
+			if (j == NUM_GP_COUNTERS + 1)
+				d[j] = c.counters[j];   /* FIXED_CTR1: passthrough */
+			else
+				d[j] = prev.initialized ? (c.counters[j] - prev.counters[j])
+				                        : c.counters[j];
+			prev.counters[j] = c.counters[j];
+		}
+		prev.initialized = true;
+
 		printf("%lu,%u,%lu,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%s,%s\n",
 			c.pid, b.core, c.cycles,
-			c.counters[0], c.counters[1], c.counters[2],
-			c.counters[3], c.counters[4], c.counters[5],
-			c.counters[6], c.counters[7],
-			c.counters[8], c.counters[9], c.counters[10],
+			d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7],
+			d[8], d[9], d[10],
 			c.handler_entry_ccnt,
 			pi.cmdline.c_str(), pi.executable.c_str());
 	}

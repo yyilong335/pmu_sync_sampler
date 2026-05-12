@@ -77,7 +77,6 @@ void dump_regs(void) {
 
 static int my_nmi_handler(unsigned int cmd, struct pt_regs *regs)
 {
-    size_t i;
     uint64_t entry_ccnt;
 
     /* Only the target CPU has counters armed; let NMIs on any other CPU
@@ -99,15 +98,13 @@ static int my_nmi_handler(unsigned int cmd, struct pt_regs *regs)
 
     gatherSample(entry_ccnt);
 
-    /* Reset all 8 GP counters and FIXED_CTR0 / FIXED_CTR2 so the next
-     * sample reports a per-period delta (FIXED_CTR1 is reloaded below to
-     * drive the next overflow). */
+    /* Reload FIXED_CTR1 to -period so the next overflow (and thus the
+     * next PMI) fires `period` cycles from now. Other counters are NOT
+     * reset; they accumulate monotonically and userspace (textreader)
+     * computes per-PMI deltas. Saves ~10 wrmsrls (~800 cyc per handler)
+     * which goes back to the workload's effective per-period budget.
+     * FIXED_CTR1 still has to be reloaded -- it's the one driving PMI. */
     write_ccnt(0xFFFFFFFFFFFF - period);
-    for (i=0; i<num_ctrs; i++) {
-        wrmsrl(MSR_ARCH_PERFMON_PERFCTR0 + i, 0);
-    }
-    wrmsrl(MSR_ARCH_PERFMON_FIXED_CTR0, 0);
-    wrmsrl(MSR_ARCH_PERFMON_FIXED_CTR0 + 2, 0);
 
     if (shutdown != 0) {
         wrmsrl(MSR_CORE_PERF_GLOBAL_CTRL, 0);
