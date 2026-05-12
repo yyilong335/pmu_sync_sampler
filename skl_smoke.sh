@@ -117,18 +117,25 @@ echo "rows whose exe ends in $BENCH_NAME: $BENCH_ROWS"
 echo "distinct pids in csv:"
 awk -F, '{print $1}' "$CSV" | sort -u | head
 
-echo "--- column means over $BENCH_NAME rows (cycles, c0..c10) ---"
+echo "--- column means over $BENCH_NAME rows (cycles, c0..c10, handler_entry_ccnt) ---"
 awk -F, -v bench="$BENCH_NAME" '
 $0 ~ bench"$" {
     n++; cyc+=$3
     for (i=4; i<=14; i++) s[i]+=$i
+    hec+=$15
 }
 END {
     if (n==0) { printf "  (no %s rows -- something wrong)\n", bench; exit }
     printf "  n=%d  cyc=%.0f", n, cyc/n
     for (i=4; i<=14; i++) printf "  c%d=%.1f", i-4, s[i]/n
+    printf "  hec=%.1f", hec/n
     print ""
     printf "  IPC (c8/cyc) = %.3f\n", s[12]/cyc
+    printf "  PMI overhead breakdown:\n"
+    printf "    total (cyc - period)        = %.0f cyc\n", cyc/n - 50000
+    printf "    hardware PMI + kernel NMI   = %.0f cyc  (handler_entry_ccnt)\n", hec/n
+    printf "    our handler pre-read_ccnt   = %.0f cyc  (cyc - period - hec)\n", cyc/n - 50000 - hec/n
+    printf "    9 inter-FIXED1 counter reads= %.0f cyc  (c9 - (cyc - period))\n", s[13]/n - (cyc/n - 50000)
 }' "$CSV"
 
 echo "=== dmesg tail ==="
