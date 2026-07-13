@@ -24,7 +24,10 @@ unsigned long num_ctrs = 8;
 
 uint64_t read_ccnt(void) {
 	uint64_t c;
-	rdpmcl(RDPMC_FIXED | 1, c);   /* FIXED_CTR1 */
+	/* PMI-driving counter is FIXED_CTR2 (CPU_CLK_UNHALTED.REF_TSC).
+	 * We reload it to -period every PMI, so this returns "REF cycles
+	 * since the current overflow". Name kept as ccnt for churn. */
+	rdpmcl(RDPMC_FIXED | 2, c);   /* FIXED_CTR2 */
 	return c;
 }
 
@@ -40,11 +43,11 @@ uint64_t read_fixed(unsigned i) {
 	return c;
 }
 
-#define write_ccnt(V) wrmsrl(MSR_ARCH_PERFMON_FIXED_CTR1, (V))
+#define write_ccnt(V) wrmsrl(MSR_ARCH_PERFMON_FIXED_CTR0 + 2, (V))  /* FIXED_CTR2 */
 #define read_cnf(I, V) rdmsrl(MSR_ARCH_PERFMON_EVENTSEL0 + (I), V)
 /* Pass through user bits 0..15 (event/umask), 18 (edge), 19 (pin),
  * 21 (anythread), 23 (invert), 24..31 (cmask). Force USR=OS=EN=1,
- * INT=0 (only FIXED1 raises PMI in this driver). */
+ * INT=0 (only FIXED2 raises PMI in this driver). */
 #define pmn_config(I, C) wrmsrl(MSR_ARCH_PERFMON_EVENTSEL0 + (I), \
             ((C) & 0xFFACFFFFULL)         \
             | (1ULL << 16) /* USR */      \
@@ -85,10 +88,10 @@ static int my_nmi_handler(unsigned int cmd, struct pt_regs *regs)
         return NMI_DONE;
 
     /* Microbench: timestamp the absolute earliest moment of our handler.
-     * FIXED_CTR1 has been counting since the overflow that triggered this
+     * FIXED_CTR2 has been counting since the overflow that triggered this
      * PMI, so its value here = "hardware PMI delivery + kernel NMI prologue"
-     * cost alone, before our handler does anything else. Stored in the
-     * sample for per-PMI overhead analysis. */
+     * cost alone, in REF cycles, before our handler does anything else.
+     * Stored in the sample for per-PMI overhead analysis. */
     entry_ccnt = read_ccnt();
 
     total_interrupts += 1;
@@ -98,12 +101,12 @@ static int my_nmi_handler(unsigned int cmd, struct pt_regs *regs)
 
     gatherSample(entry_ccnt);
 
-    /* Reload FIXED_CTR1 to -period so the next overflow (and thus the
-     * next PMI) fires `period` cycles from now. Other counters are NOT
-     * reset; they accumulate monotonically and userspace (textreader)
+    /* Reload FIXED_CTR2 to -period so the next overflow (and thus the
+     * next PMI) fires `period` REF cycles from now. Other counters are
+     * NOT reset; they accumulate monotonically and userspace (textreader)
      * computes per-PMI deltas. Saves ~10 wrmsrls (~800 cyc per handler)
      * which goes back to the workload's effective per-period budget.
-     * FIXED_CTR1 still has to be reloaded -- it's the one driving PMI. */
+     * FIXED_CTR2 still has to be reloaded -- it's the one driving PMI. */
     write_ccnt(0xFFFFFFFFFFFF - period);
 
     if (shutdown != 0) {
@@ -150,16 +153,17 @@ void startCtrsLocal(unsigned long* cfgs) {
 	    pmn_config(i, cfgs[i]);
 	    wrmsrl(MSR_ARCH_PERFMON_PERFCTR0 + i, 0);
     }
-    /* Symmetric with my_nmi_handler: clear FIXED_CTR0/2 so the very
+    /* Symmetric with my_nmi_handler: clear FIXED_CTR0/1 so the very
      * first sample after arming isn't contaminated with whatever the
-     * counters held when GLOBAL_CTRL was last cleared. (FIXED_CTR1 was
-     * just rewritten by write_ccnt above.) */
+     * counters held when GLOBAL_CTRL was last cleared. (FIXED_CTR2 was
+     * just rewritten by write_ccnt above; it drives the PMI.) */
     wrmsrl(MSR_ARCH_PERFMON_FIXED_CTR0, 0);
-    wrmsrl(MSR_ARCH_PERFMON_FIXED_CTR0 + 2, 0);
+    wrmsrl(MSR_ARCH_PERFMON_FIXED_CTR0 + 1, 0);
 
-    /* FIXED_CTR_CTRL: FIXED0 OS|USR=0x3, FIXED1 OS|USR|PMI=0xB,
-     * FIXED2 OS|USR=0x3 → 0x3 | (0xB<<4) | (0x3<<8) = 0x3B3 */
-    wrmsrl(MSR_CORE_PERF_FIXED_CTR_CTRL, 0x3B3ULL);
+    /* FIXED_CTR_CTRL: FIXED0 OS|USR=0x3, FIXED1 OS|USR=0x3,
+     * FIXED2 OS|USR|PMI=0xB → 0x3 | (0x3<<4) | (0xB<<8) = 0xB33.
+     * FIXED2 (REF_TSC) drives the PMI; FIXED1 (CORE) counts silently. */
+    wrmsrl(MSR_CORE_PERF_FIXED_CTR_CTRL, 0xB33ULL);
 
     wrmsrl(MSR_CORE_PERF_GLOBAL_OVF_CTRL,
             (1ULL << 63) | (1ULL << 62) | (7ULL << 32) | 0xFFULL);

@@ -70,13 +70,13 @@ ProcessInfo& getProcessInfo(unsigned long pid) {
 }
 
 /* Per-CPU previous-sample state. Kernel no longer resets the 8 GP
- * counters or FIXED_CTR0 / FIXED_CTR2 at handler exit, so the values in
- * c.counters[0..8, 10] arrive monotonic-accumulating since arm. textreader
+ * counters or FIXED_CTR0 / FIXED_CTR1 at handler exit, so the values in
+ * c.counters[0..9] arrive monotonic-accumulating since arm. textreader
  * computes per-PMI deltas via unsigned subtraction (mod 2^32 wraparound is
  * the right behavior for sub-2^32 deltas, which all our event rates are).
- * counters[9] is FIXED_CTR1's second read -- already per-PMI because
- * write_ccnt reloads it every handler -- passed through raw. Same for
- * cycles and handler_entry_ccnt. */
+ * counters[10] is FIXED_CTR2's second read -- already per-PMI because
+ * write_ccnt reloads it every handler (FIXED_CTR2 is the PMI-driver) --
+ * passed through raw. Same for cycles and handler_entry_ccnt. */
 struct CpuPrev {
 	unsigned int counters[NUM_GP_COUNTERS + NUM_FIXED_COUNTERS];
 	bool initialized;
@@ -97,12 +97,12 @@ void outputBuffer(struct buffer& b) {
 
 		/* First sample on this CPU: kernel set counters to 0 at arm, so
 		 * the raw value already IS the delta from arm-time. After that,
-		 * unsigned (a - b) gives the per-PMI count. counters[9] is left
-		 * raw (per-PMI by construction via write_ccnt). */
+		 * unsigned (a - b) gives the per-PMI count. counters[10] is left
+		 * raw (per-PMI by construction via write_ccnt on FIXED_CTR2). */
 		unsigned int d[NUM_GP_COUNTERS + NUM_FIXED_COUNTERS];
 		for (int j = 0; j < NUM_GP_COUNTERS + NUM_FIXED_COUNTERS; j++) {
-			if (j == NUM_GP_COUNTERS + 1)
-				d[j] = c.counters[j];   /* FIXED_CTR1: passthrough */
+			if (j == NUM_GP_COUNTERS + 2)
+				d[j] = c.counters[j];   /* FIXED_CTR2: passthrough */
 			else
 				d[j] = prev.initialized ? (c.counters[j] - prev.counters[j])
 				                        : c.counters[j];
